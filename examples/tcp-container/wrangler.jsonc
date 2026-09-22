@@ -1,0 +1,12 @@
+{
+  "name": "tcp-container",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "containers": [
+    { "class_name": "EchoContainer", "image": "./Dockerfile", "instance_type": "basic" }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "ECHO", "class_name": "EchoContainer" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EchoContainer"] }]
+}

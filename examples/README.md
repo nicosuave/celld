@@ -25,6 +25,8 @@ supports, one service or API at a time:
 - `facets/` — a Durable Object facet over a class the Worker Loader starts
 - `container/` — a Durable Object that supervises a container with
   `@cloudflare/containers`; needs `npm install` and a Docker or Podman CLI
+- `tcp-container/` — raw TCP ingress to a named container object, including
+  server-first bytes and half-close; needs a Docker or Podman CLI
 - `sandbox/` — the Cloudflare Sandbox SDK: commands, files, and processes
   in a container per sandbox; needs `npm install` and a Docker or Podman CLI
 - `pi/` — the PiHarness agent loop in a Durable Object

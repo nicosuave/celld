@@ -333,6 +333,27 @@ impl Generation {
         !self.cell_configs.is_empty()
     }
 
+    /// Resolve an operator-configured TCP target only within its declared
+    /// script and container class. A removed or renamed deployment fails closed.
+    pub fn named_container_scope(
+        &self,
+        script: &str,
+        class: &str,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.cell_configs
+                .get(class)
+                .is_some_and(|config| config.script_name == script)
+                && self
+                    .containers
+                    .iter()
+                    .any(|container| container.class_name == class),
+            "TCP target {script}/{class} is not a deployed container class"
+        );
+        Ok(crate::js::named_cell_scope(script, class, name))
+    }
+
     /// The reserved cell carrying this deployment's cron schedule, or `None`
     /// when the deployment declares no `triggers.crons`. Derived from the
     /// registered class rather than plumbed separately, so it cannot

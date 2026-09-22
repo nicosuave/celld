@@ -52,6 +52,11 @@ impl AppHandle {
 }
 
 impl LocalRequest<'_> {
+    /// Observe cancellation while the handler is still preparing its answer.
+    pub fn cancellation(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.activity.cancellation()
+    }
+
     // Reproduce the old read ticket at the request boundary. Keep the handler's
     // original sample so the omitted position remains detectable.
     #[cfg(all(test, celld_internal_tests))]

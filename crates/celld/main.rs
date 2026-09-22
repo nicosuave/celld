@@ -2929,6 +2929,7 @@ async fn handle_internal(
         _ if path.starts_with("/peer/abort/") && app.runtime.is_some() => {
             internal_abort(request, app, path).await
         }
+        "/peer/tcp" if app.runtime.is_some() => tcp_ingress::accept_peer(request, app).await,
         "/peer/tunnel" if app.runtime.is_some() => {
             if peer_tunnel::is_tunnel_request(&request) {
                 peer_tunnel::accept(request, app)
@@ -3382,6 +3383,8 @@ async fn recover_with_follower_listener(
 }
 #[path = "main/cli.rs"]
 mod cli;
+#[path = "main/tcp_ingress.rs"]
+mod tcp_ingress;
 use cli::{action_from_process, print_help, Action};
 
 #[cfg(all(test, celld_internal_tests))]
@@ -3400,6 +3403,7 @@ fn shutdown_accept_failure_test_action() -> Action {
         advertise: None,
         unsafe_public_advertise: false,
         trust_forwarded_headers: false,
+        tcp_ingress: None,
         dev_store: None,
     })
 }
@@ -3674,6 +3678,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let listen = ingress.listen.to_string();
     let listener = ingress.listener;
     let internal_listener = internal.listener;
+    let tcp_listeners = tcp_ingress::bind(settings.tcp_ingress.as_deref()).await?;
     let mut adapter_credential_version = None;
     let managed_storage = if settings.control_plane {
         if let Some(spec) = settings.bucket.take() {
@@ -4236,6 +4241,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };
+    tcp_ingress::validate_targets(&app)?;
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a
@@ -4699,6 +4705,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let (connection_drain_tx, connection_drain) = watch::channel(false);
+    let (tcp_shutdown, tcp_shutdown_rx) = watch::channel(false);
+    let _tcp_servers = tcp_ingress::serve(tcp_listeners, app.clone(), tcp_shutdown_rx);
     let shutdown_timing = celld::env_vars::shutdown_timing()?;
     let drain_ms = shutdown_timing.drain_no_progress_ms;
     let shutdown_total_ms = shutdown_timing.total_ms;
@@ -4910,6 +4918,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // cells outside the current batch must remain reachable during handoff.
     app.draining
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Bound TCP streams before waiting for public admission guards; an idle
+    // connection must not pin shutdown indefinitely.
+    let _ = tcp_shutdown.send(true);
     let stall_window = std::time::Duration::from_millis(drain_ms);
     // New drain-time connections need a fresh watch version. A receiver cloned
     // from `connection_drain` after its signal would close immediately, before

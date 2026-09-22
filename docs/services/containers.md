@@ -65,6 +65,94 @@ balancer, tunnels run cloudflared inside the container, and bucket mounts use
 the credentials that the application passes. See the
 [sandbox example](../../examples/sandbox).
 
+## Raw TCP ingress (celld extension)
+
+An operator can expose a fixed TCP listener that addresses one named container
+object. This is disabled by default and does not change the Cloudflare API.
+Pass `--tcp-ingress /etc/celld/tcp-ingress.json` to the node, or set
+`CELLD_TCP_INGRESS_CONFIG` to that file's path. The file is a JSON array:
+
+```json
+[
+  {
+    "listen": "0.0.0.0:15432",
+    "target": {
+      "script": "database-service",
+      "class_name": "Database",
+      "object_name": "primary",
+      "port": 5432,
+      "startup_path": "/start-tcp"
+    },
+    "connect_timeout_ms": 30000,
+    "max_connections": 1024
+  }
+]
+```
+
+`script` is the deployed Wrangler script name, `class_name` is its container
+Durable Object class, and `object_name` selects exactly the object that
+`env.DATABASES.getByName("primary")` selects. `port` is inside the container.
+The mapping file is read at node startup; restart the node to change it.
+Unknown fields, duplicate listeners or targets, missing container classes, and
+occupied ports fail startup. An empty array exposes nothing. The setup timeout
+defaults to 30 seconds and accepts 1–300000 milliseconds. The connection limit
+defaults to 1024 and accepts 1–65536; both the ingress and owner enforce it per
+mapping. Exceeding either limit closes the new connection.
+
+On every connection, celld resolves the object owner, activates it, and invokes
+`POST http://celld.internal/start-tcp` on that object's `fetch()` handler. The
+hook must be idempotent, start the container with the application's required
+environment and options, wait for application readiness, and return an empty
+`204`. For example, probe a container HTTP health endpoint; on macOS a published
+port can accept TCP before the application is listening. The normal output gate
+proves the hook's storage writes before TCP forwarding begins. celld then waits
+for the container port within the setup deadline. A hook error, timeout, or
+unavailable port closes the client connection; no HTTP error bytes are inserted
+into the TCP protocol. The hook is never retried after it may have executed.
+
+Use the [TCP container example](../../examples/tcp-container) for a complete
+startup hook and server-first echo protocol. It needs no client shim. On macOS,
+the image must `EXPOSE` the target port, as with `getTcpPort()`.
+
+For a fleet, install the same targets on every possible owner. Listening IPs and
+ports may differ between nodes. Each owner requires an exact target match,
+including the startup path, before accepting the signed peer establishment.
+A missing or changed target fails closed. The ingress does not accept a client
+supplied destination address or port.
+
+Configure an ordinary TCP load balancer like this:
+
+| Setting | Value for this example |
+| --- | --- |
+| Public frontend | `db.example.com:5432`, raw TCP |
+| Backend pool | Each celld node's reachable address, port `15432` |
+| Health check | HTTP `GET /.well-known/celld/health` on the node's Worker listener |
+| Peer connectivity | Each node's advertised internal address must reach every other node |
+
+The load balancer chooses a healthy ingress node; celld chooses the owner. It
+needs no sticky sessions and no updates when the object moves. A connection
+follows `client → ingress node → owner node → container:5432`. If ingress owns
+the object, the peer hop disappears. Container bridge ports stay private.
+Checking the TCP service itself starts the container, so use the HTTP readiness
+check instead of a connect probe when wake-on-traffic matters.
+
+After establishment, both directions carry opaque bytes with backpressure and
+TCP half-close support. A server can send first. TLS can pass through to the
+container, but celld does not terminate it, authenticate public TCP clients,
+preserve the client's source IP, or generate/consume PROXY protocol headers.
+Apply client access policy at the load balancer or in the container protocol.
+Peer transport uses the same private-network boundary as other celld traffic.
+
+A connection pins the owning object against ordinary idle eviction. The
+application's own alarms, including an SDK `sleepAfter` alarm, can still destroy
+the container; configure those policies deliberately for long-lived sockets.
+A container exit, ownership cancellation, or deployment cancellation closes
+the connection. Ingress shutdown stops accepting and allows existing streams
+two seconds to finish before closing them. A move or restart preserves the
+endpoint and durable object state, but destroys the container and its live TCP
+sessions. Clients must reconnect; bytes from an established session are never
+replayed on a new owner.
+
 ## The image and the node
 
 Cloudflare pushes an image to its own registry, distributes it across its

@@ -12588,6 +12588,13 @@ fn shared_namespace_key(class_name: &str) -> Option<&'static str> {
     }
 }
 
+/// The same named-object address used by `DurableObjectNamespace.getByName`.
+pub(crate) fn named_cell_scope(script: &str, class: &str, name: &str) -> String {
+    let key = namespace_key(script, class);
+    let id = durable_object_id_for_name(&key, name);
+    format!("{class}:{}", durable_object_id_hex(&id))
+}
+
 pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
     match shared_namespace_key(class_name) {
         Some(shared) => shared.to_string(),
