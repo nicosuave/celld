@@ -67,37 +67,41 @@ the credentials that the application passes. See the
 
 ## Raw TCP ingress (celld extension)
 
-An operator can expose a fixed TCP listener that addresses one named container
-object. This is disabled by default and does not change the Cloudflare API.
-Pass `--tcp-ingress /etc/celld/tcp-ingress.json` to the node, or set
-`CELLD_TCP_INGRESS_CONFIG` to that file's path. The file is a JSON array:
+Declare TCP endpoints in the application's `wrangler.jsonc` and deploy normally.
+TCP ingress is disabled when `tcp` is absent or empty. For example:
 
 ```json
-[
+"tcp": [
   {
-    "listen": "0.0.0.0:15432",
-    "target": {
-      "script": "database-service",
-      "class_name": "Database",
-      "object_name": "primary",
-      "port": 5432,
-      "startup_path": "/start-tcp"
-    },
-    "connect_timeout_ms": 30000,
-    "max_connections": 1024
+    "listen_port": 15432,
+    "class_name": "Database",
+    "object_name": "primary",
+    "container_port": 5432
   }
 ]
 ```
 
-`script` is the deployed Wrangler script name, `class_name` is its container
-Durable Object class, and `object_name` selects exactly the object that
-`env.DATABASES.getByName("primary")` selects. `port` is inside the container.
-The mapping file is read at node startup; restart the node to change it.
-Unknown fields, duplicate listeners or targets, missing container classes, and
-occupied ports fail startup. An empty array exposes nothing. The setup timeout
-defaults to 30 seconds and accepts 1–300000 milliseconds. The connection limit
-defaults to 1024 and accepts 1–65536; both the ingress and owner enforce it per
-mapping. Exceeding either limit closes the new connection.
+The script is the deployment's own Wrangler name. `class_name` must name one
+of its container Durable Object classes, and `object_name` selects exactly the
+object that `env.DATABASES.getByName("primary")` selects. `container_port` is
+inside the container. Each node binds `listen_port` on the same IP address as
+its HTTP Worker listener: use the node's ordinary `--listen` option to choose
+loopback or a reachable interface. No per-node mapping file is needed.
+
+The existing deployment watcher applies additions, changes, and removals without
+a node restart. All new sockets are reserved before adopting a generation. If a
+port is occupied, that node rejects adoption and keeps its previous deployment
+and TCP listeners; `POST /reload` reports the bind error. A bind conflict at
+boot fails startup. Deployment publication cannot preflight every node's OS
+ports: check rollout/adoption status. Duplicate ports or targets, unknown fields,
+and classes without containers are rejected while building the deployment;
+conflicts across cohosted scripts are rejected when building the generation.
+
+Optional fields are `startup_path` (default `/start-tcp`),
+`connect_timeout_ms` (default 30000, range 1–300000), and `max_connections`
+(default 1024, range 1–65536). Both ingress and owner enforce the connection
+limit per mapping; exceeding either closes the new connection. An endpoint
+addresses one named object, not a pool of replicas.
 
 On every connection, celld resolves the object owner, activates it, and invokes
 `POST http://celld.internal/start-tcp` on that object's `fetch()` handler. The
@@ -114,11 +118,11 @@ Use the [TCP container example](../../examples/tcp-container) for a complete
 startup hook and server-first echo protocol. It needs no client shim. On macOS,
 the image must `EXPOSE` the target port, as with `getTcpPort()`.
 
-For a fleet, install the same targets on every possible owner. Listening IPs and
-ports may differ between nodes. Each owner requires an exact target match,
-including the startup path, before accepting the signed peer establishment.
-A missing or changed target fails closed. The ingress does not accept a client
-supplied destination address or port.
+For a fleet, every node obtains the targets from the same deployment. The owner
+requires an exact target match, including the startup path, before accepting a
+signed peer establishment. During rollout, incompatible old/new targets fail
+closed until both nodes adopt the deployment. A client cannot supply an
+arbitrary destination address or port.
 
 Configure an ordinary TCP load balancer like this:
 
@@ -146,8 +150,9 @@ Peer transport uses the same private-network boundary as other celld traffic.
 A connection pins the owning object against ordinary idle eviction. The
 application's own alarms, including an SDK `sleepAfter` alarm, can still destroy
 the container; configure those policies deliberately for long-lived sockets.
-A container exit, ownership cancellation, or deployment cancellation closes
-the connection. Ingress shutdown stops accepting and allows existing streams
+A container exit or ownership cancellation closes the connection. Adopting a
+deployment closes existing ingress connections, including on unchanged TCP
+ports; clients reconnect against the new deployment. Ingress shutdown stops accepting and allows existing streams
 two seconds to finish before closing them. A move or restart preserves the
 endpoint and durable object state, but destroys the container and its live TCP
 sessions. Clients must reconnect; bytes from an established session are never

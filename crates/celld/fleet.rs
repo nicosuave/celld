@@ -930,7 +930,15 @@ async fn load_worker_at_pointer(
     let crons = manifest.crons.clone();
     let containers = manifest.containers.clone();
     let fence_image = manifest.fence_image.clone();
+    let tcp = crate::tcp_config::read(
+        &manifest.raw_metadata,
+        &containers
+            .iter()
+            .map(|c| c.class_name.clone())
+            .collect::<Vec<_>>(),
+    )?;
     Ok(LoadedDeployment {
+        tcp,
         options: WorkerConfigOptions {
             src,
             script_name: script_name.clone(),
@@ -961,6 +969,7 @@ async fn load_worker_at_pointer(
 }
 
 pub struct LoadedDeployment {
+    pub tcp: Vec<crate::tcp_config::TcpIngress>,
     pub options: WorkerConfigOptions,
     pub script_name: String,
     pub version: String,

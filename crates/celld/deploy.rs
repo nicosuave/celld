@@ -55,6 +55,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "r2_buckets",
     "worker_loaders",
     "containers",
+    "tcp",
     "no_bundle",
     "define",
     "rules",
@@ -678,6 +679,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         // partially deserializing the manifest and failing at worker load.
         required_features: {
             let mut features = Vec::new();
+            if project.metadata.get("tcp").is_some() {
+                features.push(crate::protocol::FEATURE_TCP_INGRESS_V1.to_string());
+            }
             if built_assets.is_some() {
                 features.push(FEATURE_ASSETS_V1.to_string());
             }
@@ -1935,6 +1939,16 @@ fn read_project(
     }
 
     let containers = read_containers(object, &do_classes, &sqlite_classes)?;
+    let tcp = crate::tcp_config::read(
+        &Value::Object(object.clone()),
+        &containers
+            .iter()
+            .map(|c| c.class_name.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    if !tcp.is_empty() {
+        metadata.insert("tcp".into(), json!(tcp));
+    }
     Ok(Project {
         script_name,
         no_bundle,

@@ -1021,7 +1021,6 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `AZURE_AUTHORITY_HOST`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` | The standard AKS workload identity environment for an `az://` bucket. The authority must be the public Azure host |
 | `AZURE_STORAGE_USE_EMULATOR` | Set to `true` to develop against Azurite. celld does not qualify Azurite for a production fleet |
 | `CELLD_ADDR` | The public Worker listener. The same as `--listen` |
-| `CELLD_TCP_INGRESS_CONFIG` | Optional JSON file of [TCP container ingress mappings](services/containers.md#raw-tcp-ingress-celld-extension). The same as `--tcp-ingress`; disabled unless configured |
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. This setting does not resolve a DNS name or restrict the internal listener |

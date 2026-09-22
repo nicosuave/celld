@@ -19,6 +19,7 @@ use tokio::process::{Child, Command};
 
 struct Node {
     child: Child,
+    host: &'static str,
     http: u16,
     internal: u16,
     tcp: u16,
@@ -37,30 +38,22 @@ fn port() -> u16 {
 }
 
 impl Node {
-    async fn start(root: &Path, label: &str, bucket: &Path) -> anyhow::Result<Self> {
+    async fn start(
+        root: &Path,
+        label: &str,
+        bucket: &Path,
+        ports: [u16; 3],
+    ) -> anyhow::Result<Self> {
         let http = port();
         let internal = port();
-        let tcp = port();
-        let rejected_hook = port();
-        let unavailable_port = port();
-        let name = format!("tcp-test-{}-{label}", std::process::id());
-        let config = root.join(format!("{label}.json"));
-        let target = |startup_path: &str| {
-            json!({
-                "script": "tcp-container", "class_name": "EchoContainer",
-                "object_name": "primary", "port": 7000, "startup_path": startup_path
-            })
+        let [tcp, rejected_hook, unavailable_port] = ports;
+        // Two real nodes share deployment ports on separate loopback families.
+        let host = if label == "owner" {
+            "127.0.0.1"
+        } else {
+            "[::1]"
         };
-        let mut unavailable = target("/start-tcp");
-        unavailable["port"] = json!(7002);
-        std::fs::write(
-            &config,
-            serde_json::to_vec(&json!([
-                { "listen": format!("127.0.0.1:{tcp}"), "target": target("/start-tcp"), "max_connections": 1 },
-            { "listen": format!("127.0.0.1:{rejected_hook}"), "target": target("/missing-hook"), "connect_timeout_ms": 1000 },
-            { "listen": format!("127.0.0.1:{unavailable_port}"), "target": unavailable, "connect_timeout_ms": 500, "max_connections": 1 }
-            ]))?,
-        )?;
+        let name = format!("tcp-test-{}-{label}", std::process::id());
         let log = root.join(format!("{label}.log"));
         let output = std::fs::File::create(&log)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_celld"));
@@ -83,16 +76,15 @@ impl Node {
                 "--bucket",
                 "celld-dev",
                 "--listen",
-                &format!("127.0.0.1:{http}"),
+                &format!("{host}:{http}"),
                 "--internal-listen",
                 &format!("127.0.0.1:{internal}"),
-                "--tcp-ingress",
-                config.to_str().unwrap(),
             ])
             .env("CELLD_INTERNAL_DEV_STORE", bucket)
             .env("CELLD_WATCH", root.join(label))
             .env("CELLD_NODE", &name)
             .env("CELLD_IDLE_EVICT_S", "1")
+            .env("CELLD_DEPLOY_POLL_S", "1")
             .env("CELLD_REBALANCE_INTERVAL_MS", "0")
             .env("CELLD_SHUTDOWN_TOTAL_MS", "10000")
             .env("RUST_LOG", "info,celld::tcp_ingress=debug")
@@ -102,6 +94,7 @@ impl Node {
             .spawn()?;
         let mut node = Self {
             child,
+            host,
             http,
             internal,
             tcp,
@@ -119,7 +112,7 @@ impl Node {
                     std::fs::read_to_string(&node.log)?
                 );
                 if client
-                    .get(format!("http://127.0.0.1:{http}/.well-known/celld/health"))
+                    .get(format!("http://{host}:{http}/.well-known/celld/health"))
                     .send()
                     .await
                     .is_ok_and(|reply| reply.status().is_success())
@@ -136,7 +129,7 @@ impl Node {
 
     async fn status(&self) -> anyhow::Result<Value> {
         Ok(
-            reqwest::get(format!("http://127.0.0.1:{}/status", self.http))
+            reqwest::get(format!("http://{}:{}/status", self.host, self.http))
                 .await?
                 .error_for_status()?
                 .json()
@@ -146,7 +139,7 @@ impl Node {
 
     async fn connect(&self) -> anyhow::Result<TcpStream> {
         let result = tokio::time::timeout(Duration::from_secs(35), async {
-            let mut stream = TcpStream::connect(("127.0.0.1", self.tcp)).await?;
+            let mut stream = TcpStream::connect(format!("{}:{}", self.host, self.tcp)).await?;
             let mut greeting = [0; 6];
             stream.read_exact(&mut greeting).await?;
             anyhow::ensure!(&greeting == b"READY\n", "wrong server-first greeting");
@@ -256,10 +249,23 @@ async fn exercise_fleet(root: &Path) -> anyhow::Result<()> {
     let bucket = celld::dev::open_local_bucket(&database)?;
     celld::fleet::validate_bucket(&bucket).await?;
     celld::wake_format::ensure_ready(&bucket).await?;
-    let project =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/tcp-container/wrangler.jsonc");
-    let built = celld::deploy::build(&celld::deploy::Options {
-        config: Some(project),
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/tcp-container");
+    let project_dir = root.join("project");
+    std::fs::create_dir(&project_dir)?;
+    for file in ["Dockerfile", "index.js", "server.mjs", "wrangler.jsonc"] {
+        std::fs::copy(source.join(file), project_dir.join(file))?;
+    }
+    let project = project_dir.join("wrangler.jsonc");
+    let ports = [port(), port(), port()];
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&project)?)?;
+    config["tcp"] = json!([
+        {"listen_port": ports[0], "class_name": "EchoContainer", "object_name": "primary", "container_port": 7000, "max_connections": 1},
+        {"listen_port": ports[1], "class_name": "EchoContainer", "object_name": "primary", "container_port": 7000, "startup_path": "/missing-hook", "connect_timeout_ms": 1000},
+        {"listen_port": ports[2], "class_name": "EchoContainer", "object_name": "primary", "container_port": 7002, "connect_timeout_ms": 500}
+    ]);
+    std::fs::write(&project, serde_json::to_vec(&config)?)?;
+    let options = celld::deploy::Options {
+        config: Some(project.clone()),
         bucket: None,
         endpoint: None,
         region: None,
@@ -267,14 +273,15 @@ async fn exercise_fleet(root: &Path) -> anyhow::Result<()> {
         json: false,
         vars: Default::default(),
         local_images: true,
-    })?;
+    };
+    let built = celld::deploy::build(&options)?;
     celld::deploy::write(&bucket, &built).await?;
 
-    let mut owner = Node::start(root, "owner", &database).await?;
+    let mut owner = Node::start(root, "owner", &database, ports).await?;
     let before = owner.status().await?; // Place primary on A before B joins.
     assert_eq!(before["connections"], 0);
     assert_eq!(before["running"], false);
-    let mut ingress = Node::start(root, "ingress", &database).await?;
+    let mut ingress = Node::start(root, "ingress", &database, ports).await?;
 
     // Cold container start through B must run A's named object, not a second
     // object. A long-lived TCP connection must survive ordinary idle eviction.
@@ -307,13 +314,17 @@ async fn exercise_fleet(root: &Path) -> anyhow::Result<()> {
     // Both local and peer arrivals consume the owner's cap, so using a
     // different ingress node cannot bypass it.
     let local = owner.connect().await?;
-    assert_closed(TcpStream::connect(("127.0.0.1", ingress.tcp)).await?).await?;
+    assert_closed(TcpStream::connect(format!("{}:{}", ingress.host, ingress.tcp)).await?).await?;
     drop(local);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_closed(TcpStream::connect(("127.0.0.1", ingress.rejected_hook)).await?).await?;
+    assert_closed(TcpStream::connect(format!("{}:{}", ingress.host, ingress.rejected_hook)).await?)
+        .await?;
     // A successful hook does not override the readiness deadline when the
     // selected container port never opens. No protocol error bytes escape.
-    assert_closed(TcpStream::connect(("127.0.0.1", ingress.unavailable_port)).await?).await?;
+    assert_closed(
+        TcpStream::connect(format!("{}:{}", ingress.host, ingress.unavailable_port)).await?,
+    )
+    .await?;
     let denied = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}/peer/tcp", owner.internal))
         .header("connection", "upgrade")
@@ -370,7 +381,7 @@ async fn exercise_fleet(root: &Path) -> anyhow::Result<()> {
     stopped?;
     closed?;
 
-    let mut successor = Node::start(root, "successor", &database).await?;
+    let mut successor = Node::start(root, "successor", &database, ports).await?;
     let forwarded = successor.connect().await?;
     let saved = owner.status().await?["connections"].as_u64().unwrap();
     // Owner handoff cancels the stream and starts a fresh container on B.
@@ -380,6 +391,127 @@ async fn exercise_fleet(root: &Path) -> anyhow::Result<()> {
     let reconnected = successor.connect().await?;
     assert_eq!(successor.status().await?["connections"], saved + 1);
     drop(reconnected);
+    let pid = successor.child.id();
+    let occupied = tokio::net::TcpListener::bind("[::1]:0").await?;
+    let conflict_port = occupied.local_addr()?.port();
+    config["tcp"].as_array_mut().unwrap().push(json!({
+        "listen_port": conflict_port, "class_name": "EchoContainer", "object_name": "other", "container_port": 7000
+    }));
+    std::fs::write(&project, serde_json::to_vec(&config)?)?;
+    let conflict = celld::deploy::build(&options)?;
+    assert_ne!(
+        built.version, conflict.version,
+        "TCP config participates in deployment identity"
+    );
+    assert!(conflict
+        .manifest
+        .required_features
+        .iter()
+        .any(|f| f == "tcp-ingress-v1"));
+    celld::deploy::write(&bucket, &conflict).await?;
+    let reply = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/reload", successor.internal))
+        .send()
+        .await?;
+    assert_eq!(reply.status(), 422);
+    assert!(reply.text().await?.contains("bind TCP ingress"));
+    drop(successor.connect().await?); // Old deployment remains available.
+
+    config["tcp"] = json!([{
+        "listen_port": ports[0], "class_name": "EchoContainer", "object_name": "replacement", "container_port": 7000
+    }]);
+    std::fs::write(&project, serde_json::to_vec(&config)?)?;
+    celld::deploy::write(&bucket, &celld::deploy::build(&options)?).await?;
+    reload(&successor).await?;
+    drop(successor.connect().await?); // Same listening socket, new named object.
+    assert_eq!(successor.status().await?["connections"], saved + 2);
+    assert!(
+        TcpStream::connect(format!("{}:{}", successor.host, ports[1]))
+            .await
+            .is_err()
+    );
+
+    let new_port = port();
+    config["tcp"][0]["listen_port"] = json!(new_port);
+    std::fs::write(&project, serde_json::to_vec(&config)?)?;
+    celld::deploy::write(&bucket, &celld::deploy::build(&options)?).await?;
+    reload(&successor).await?;
+    successor.tcp = new_port;
+    drop(successor.connect().await?);
+    assert!(
+        TcpStream::connect(format!("{}:{}", successor.host, ports[0]))
+            .await
+            .is_err()
+    );
+    config["tcp"] = json!([]);
+    std::fs::write(&project, serde_json::to_vec(&config)?)?;
+    celld::deploy::write(&bucket, &celld::deploy::build(&options)?).await?;
+    // No /reload nudge: the normal pointer watcher must remove the endpoint.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while TcpStream::connect(format!("{}:{}", successor.host, new_port))
+            .await
+            .is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("deployment watcher did not remove TCP listener")?;
+    assert_eq!(
+        successor.child.id(),
+        pid,
+        "reload must not restart the node"
+    );
     successor.stop().await?;
     Ok(())
+}
+
+async fn reload(node: &Node) -> anyhow::Result<()> {
+    let reply = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/reload", node.internal))
+        .send()
+        .await?;
+    let status = reply.status();
+    let body = reply.text().await?;
+    anyhow::ensure!(status.is_success(), "reload failed: {body}");
+    Ok(())
+}
+
+#[test]
+fn deployment_tcp_config_validates_targets_ports_and_limits() {
+    let classes = vec!["EchoContainer".to_string()];
+    let config = json!({"tcp": [{"listen_port": 4543, "class_name": "EchoContainer", "object_name": "primary", "container_port": 7000}]});
+    let routes = celld::tcp_config::read(&config, &classes).unwrap();
+    assert_eq!(routes[0].startup_path, "/start-tcp");
+    assert_eq!(routes[0].connect_timeout_ms, 30000);
+    assert_eq!(routes[0].max_connections, 1024);
+    assert!(celld::tcp_config::read(&json!({}), &classes)
+        .unwrap()
+        .is_empty());
+    for (key, value) in [
+        ("listen_port", json!(0)),
+        ("container_port", json!(65536)),
+        ("class_name", json!("Missing")),
+        ("object_name", json!("x".repeat(1025))),
+        ("startup_path", json!("//elsewhere")),
+        ("startup_path", json!("/start?x=1")),
+        ("connect_timeout_ms", json!(0)),
+        ("max_connections", json!(65537)),
+        ("unknown", json!(true)),
+    ] {
+        let mut invalid = config.clone();
+        invalid["tcp"][0][key] = value;
+        assert!(
+            celld::tcp_config::read(&invalid, &classes).is_err(),
+            "{invalid}"
+        );
+    }
+    let mut duplicate = config.clone();
+    duplicate["tcp"]
+        .as_array_mut()
+        .unwrap()
+        .push(config["tcp"][0].clone());
+    assert!(celld::tcp_config::read(&duplicate, &classes).is_err());
+    duplicate["tcp"][1]["listen_port"] = json!(4545);
+    assert!(celld::tcp_config::read(&duplicate, &classes).is_err());
 }

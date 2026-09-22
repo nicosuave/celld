@@ -863,7 +863,12 @@ async fn adopt_deployment(
         Ok(Err(error)) => return failed(format!("{error:#}")),
         Err(error) => return failed(format!("generation build panicked: {error}")),
     };
+    let tcp_listeners = match tcp_ingress::prepare(Some(&generation)).await {
+        Ok(listeners) => listeners,
+        Err(error) => return failed(format!("{error:#}")),
+    };
     let adopted = runtime.adopt(generation);
+    tcp_ingress::publish(tcp_listeners, app.clone());
     // Tell the core, so resident cells move to the new generation at their
     // safe points. The reserved cells move at once, ahead of the cron arm
     // below, which must reach a cron cell already running the new schedule.
@@ -3403,7 +3408,6 @@ fn shutdown_accept_failure_test_action() -> Action {
         advertise: None,
         unsafe_public_advertise: false,
         trust_forwarded_headers: false,
-        tcp_ingress: None,
         dev_store: None,
     })
 }
@@ -3678,7 +3682,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let listen = ingress.listen.to_string();
     let listener = ingress.listener;
     let internal_listener = internal.listener;
-    let tcp_listeners = tcp_ingress::bind(settings.tcp_ingress.as_deref()).await?;
     let mut adapter_credential_version = None;
     let managed_storage = if settings.control_plane {
         if let Some(spec) = settings.bucket.take() {
@@ -4071,6 +4074,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     services: Vec::new(),
                     crons,
                     containers: Vec::new(),
+                    tcp: Vec::new(),
                     fence_image: None,
                 }),
                 GenerationOptions {
@@ -4241,7 +4245,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };
-    tcp_ingress::validate_targets(&app)?;
+    tcp_ingress::initialize(listener.local_addr()?.ip());
+    let tcp_listeners =
+        tcp_ingress::prepare(app.runtime.as_ref().map(|r| r.generation()).as_deref()).await?;
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a
@@ -4654,6 +4660,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .detach();
     }
 
+    tcp_ingress::publish(tcp_listeners, app.clone());
     // Arm the schedule, then watch the pointer. Adoption arms it again, so
     // a cron change travels with the deployment that carries it.
     spawn_cron_arm(app.clone());
@@ -4705,8 +4712,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let (connection_drain_tx, connection_drain) = watch::channel(false);
-    let (tcp_shutdown, tcp_shutdown_rx) = watch::channel(false);
-    let _tcp_servers = tcp_ingress::serve(tcp_listeners, app.clone(), tcp_shutdown_rx);
     let shutdown_timing = celld::env_vars::shutdown_timing()?;
     let drain_ms = shutdown_timing.drain_no_progress_ms;
     let shutdown_total_ms = shutdown_timing.total_ms;
@@ -4920,7 +4925,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .store(true, std::sync::atomic::Ordering::SeqCst);
     // Bound TCP streams before waiting for public admission guards; an idle
     // connection must not pin shutdown indefinitely.
-    let _ = tcp_shutdown.send(true);
+    tcp_ingress::shutdown().await;
     let stall_window = std::time::Duration::from_millis(drain_ms);
     // New drain-time connections need a fresh watch version. A receiver cloned
     // from `connection_drain` after its signal would close immediately, before

@@ -8,7 +8,7 @@ use super::*;
 use celld::container::{CellContainer, ContainerEngine};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -19,7 +19,24 @@ use tokio::task::JoinSet;
 const PEER_PATH: &str = "/peer/tcp";
 const PROTOCOL: &str = "celld-container-tcp-v1";
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
-static MAPPINGS: OnceLock<Vec<Arc<Mapping>>> = OnceLock::new();
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+static LISTEN_IP: OnceLock<std::net::IpAddr> = OnceLock::new();
+
+#[derive(Default)]
+struct State {
+    stopped: bool,
+    listeners: Vec<Listener>,
+    servers: JoinSet<()>,
+    mappings: Vec<Arc<Mapping>>,
+    shutdown: Option<watch::Sender<bool>>,
+}
+
+pub(super) fn initialize(ip: std::net::IpAddr) {
+    LISTEN_IP.set(ip).expect("TCP ingress initialized once");
+    STATE
+        .set(Mutex::new(State::default()))
+        .unwrap_or_else(|_| panic!("TCP ingress initialized once"));
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -33,23 +50,12 @@ struct Target {
     startup_path: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MappingConfig {
     listen: SocketAddr,
     target: Target,
-    #[serde(default = "default_connect_timeout_ms")]
     connect_timeout_ms: u64,
-    #[serde(default = "default_max_connections")]
     max_connections: usize,
-}
-
-fn default_connect_timeout_ms() -> u64 {
-    30_000
-}
-
-fn default_max_connections() -> usize {
-    1024
 }
 
 struct Mapping {
@@ -77,92 +83,120 @@ impl Mapping {
     }
 }
 
-fn parse_config(bytes: &[u8]) -> anyhow::Result<Vec<MappingConfig>> {
-    let configs: Vec<MappingConfig> = serde_json::from_slice(bytes)?;
-    for (index, config) in configs.iter().enumerate() {
-        let target = &config.target;
-        anyhow::ensure!(
-            config.listen.port() != 0 && target.port != 0,
-            "TCP ports must be nonzero"
-        );
-        anyhow::ensure!(
-            !target.script.is_empty() && !target.class_name.is_empty()
-                && !celld::deploy::is_reserved_class(&target.class_name) && !target.class_name.contains(':')
-                && target.object_name.len() <= 1024,
-            "TCP target requires a script, application class, and object name of at most 1024 bytes"
-        );
-        anyhow::ensure!(
-            target.startup_path.starts_with('/')
-                && !target.startup_path.starts_with("//")
-                && !target
-                    .startup_path
-                    .chars()
-                    .any(|c| c.is_control() || matches!(c, '?' | '#' | '\\')),
-            "TCP startup_path must be an absolute URL path without query or fragment"
-        );
-        anyhow::ensure!(
-            (1..=300_000).contains(&config.connect_timeout_ms)
-                && (1..=65_536).contains(&config.max_connections),
-            "TCP connect_timeout_ms must be 1..=300000 and max_connections 1..=65536"
-        );
-        anyhow::ensure!(
-            !configs[..index]
-                .iter()
-                .any(|other| other.listen == config.listen || other.target == *target),
-            "duplicate TCP listener or target"
-        );
-        anyhow::ensure!(
-            serde_json::to_vec(&Establish {
-                target: target.clone(),
-                capacity_handoff: false
-            })?
-            .len()
-                <= MAX_HANDSHAKE_BYTES,
-            "TCP target exceeds the peer handshake size limit"
-        );
-    }
-    Ok(configs)
-}
-
+#[derive(Clone)]
 pub(super) struct Listener {
-    socket: TcpListener,
+    socket: Arc<TcpListener>,
     mapping: Arc<Mapping>,
 }
 
-/// Bind all listeners before publishing any of them. A bad mapping or occupied
-/// port fails startup rather than leaving a partially exposed service.
-pub(super) async fn bind(path: Option<&Path>) -> anyhow::Result<Vec<Listener>> {
-    let configs = match path {
-        Some(path) => {
-            parse_config(&std::fs::read(path).with_context(|| format!("read {}", path.display()))?)?
+/// Reserve every new socket before changing the active generation. Existing
+/// sockets are shared so a target change on the same port needs no rebind.
+/// Dropping a failed preparation releases only its newly reserved ports.
+pub(super) async fn prepare(generation: Option<&Generation>) -> anyhow::Result<Vec<Listener>> {
+    let configs = generation
+        .into_iter()
+        .flat_map(|g| g.tcp_ingress())
+        .map(|(script, route)| MappingConfig {
+            listen: SocketAddr::new(
+                *LISTEN_IP.get().expect("TCP initialized"),
+                route.listen_port,
+            ),
+            target: Target {
+                script: script.clone(),
+                class_name: route.class_name.clone(),
+                object_name: route.object_name.clone(),
+                port: route.container_port,
+                startup_path: route.startup_path.clone(),
+            },
+            connect_timeout_ms: route.connect_timeout_ms,
+            max_connections: route.max_connections,
+        })
+        .collect::<Vec<_>>();
+    if let Some(generation) = generation {
+        for config in &configs {
+            let target = &config.target;
+            generation.named_container_scope(
+                &target.script,
+                &target.class_name,
+                &target.object_name,
+            )?;
+            anyhow::ensure!(
+                serde_json::to_vec(&Establish {
+                    target: target.clone(),
+                    capacity_handoff: false
+                })?
+                .len()
+                    <= MAX_HANDSHAKE_BYTES,
+                "TCP target exceeds the peer handshake size limit"
+            );
         }
-        None => Vec::new(),
-    };
+    }
+    prepare_configs(configs).await
+}
+
+async fn prepare_configs(configs: Vec<MappingConfig>) -> anyhow::Result<Vec<Listener>> {
+    let previous = STATE
+        .get()
+        .expect("TCP initialized")
+        .lock()
+        .unwrap()
+        .listeners
+        .clone();
     let mut listeners = Vec::new();
-    let mut mappings = Vec::new();
     for config in configs {
-        let socket = TcpListener::bind(config.listen)
-            .await
-            .with_context(|| format!("bind TCP ingress {}", config.listen))?;
-        let mapping = Arc::new(Mapping {
-            ingress_slots: Arc::new(Semaphore::new(config.max_connections)),
-            owner_slots: Arc::new(Semaphore::new(config.max_connections)),
-            config,
-        });
-        mappings.push(mapping.clone());
+        let existing = previous
+            .iter()
+            .find(|old| old.mapping.config.listen == config.listen);
+        let socket = match existing {
+            Some(old) => old.socket.clone(),
+            None => Arc::new(
+                TcpListener::bind(config.listen)
+                    .await
+                    .with_context(|| format!("bind TCP ingress {}", config.listen))?,
+            ),
+        };
+        let mapping = match existing.filter(|old| old.mapping.config == config) {
+            Some(old) => old.mapping.clone(),
+            None => Arc::new(Mapping {
+                ingress_slots: Arc::new(Semaphore::new(config.max_connections)),
+                owner_slots: Arc::new(Semaphore::new(config.max_connections)),
+                config,
+            }),
+        };
         listeners.push(Listener { socket, mapping });
     }
-    MAPPINGS
-        .set(mappings)
-        .map_err(|_| anyhow::anyhow!("TCP ingress already configured"))?;
     Ok(listeners)
 }
 
-pub(super) fn validate_targets(app: &AppHandle) -> anyhow::Result<()> {
-    for mapping in MAPPINGS.get().into_iter().flatten() {
-        mapping.scope(app)?;
+/// Called without an await immediately after runtime adoption. New accepts and
+/// peer authorizations use the new mappings. Deployment changes close existing
+/// ingress streams; clients reconnect against the newly adopted generation.
+pub(super) fn publish(listeners: Vec<Listener>, app: AppHandle) {
+    let mut state = STATE.get().expect("TCP initialized").lock().unwrap();
+    // A deployment build may have started before shutdown. It must never
+    // restart accepting public connections after the shutdown cut.
+    if state.stopped {
+        return;
     }
-    Ok(())
+    state.servers.abort_all();
+    let (shutdown, receiver) = watch::channel(false);
+    state.shutdown = Some(shutdown);
+    state.mappings = listeners.iter().map(|l| l.mapping.clone()).collect();
+    state.listeners = listeners.clone();
+    state.servers = serve(listeners, app, receiver);
+}
+
+pub(super) async fn shutdown() {
+    let mut servers = {
+        let mut state = STATE.get().expect("TCP initialized").lock().unwrap();
+        state.stopped = true;
+        state.listeners.clear();
+        if let Some(shutdown) = state.shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        std::mem::take(&mut state.servers)
+    };
+    while servers.join_next().await.is_some() {}
 }
 
 pub(super) fn serve(
@@ -211,8 +245,6 @@ pub(super) fn serve(
                 }
             }
             drop(listener);
-            // Match the HTTP transport grace. Dropping the JoinSet after this
-            // bound closes streams and releases their public/activity guards.
             let _ = tokio::time::timeout(CONNECTION_DRAIN_GRACE, async {
                 while connections.join_next().await.is_some() {}
             }).await;
@@ -500,13 +532,16 @@ pub(super) async fn accept_peer(mut request: Request<Incoming>, app: AppHandle) 
         Ok(establish) => establish,
         Err(_) => return peer_response(response(StatusCode::BAD_REQUEST, "invalid TCP target")),
     };
-    let Some(mapping) = MAPPINGS
+    let mapping = STATE
         .get()
-        .into_iter()
-        .flatten()
-        .find(|m| m.config.target == establish.target)
-        .cloned()
-    else {
+        .expect("TCP initialized")
+        .lock()
+        .unwrap()
+        .mappings
+        .iter()
+        .find(|mapping| mapping.config.target == establish.target)
+        .cloned();
+    let Some(mapping) = mapping else {
         return peer_response(response(
             StatusCode::FORBIDDEN,
             "TCP target is not configured on this node",
@@ -588,71 +623,6 @@ fn stale_reply() -> HttpReply {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    fn config() -> serde_json::Value {
-        serde_json::json!([{
-            "listen": "127.0.0.1:4543",
-            "target": {
-                "script": "tcp-container", "class_name": "EchoContainer",
-                "object_name": "primary", "port": 7000, "startup_path": "/start-tcp"
-            }
-        }])
-    }
-
-    #[test]
-    fn mapping_requires_explicit_valid_target_and_bounds() {
-        let parsed = parse_config(&serde_json::to_vec(&config()).unwrap()).unwrap();
-        assert_eq!(parsed[0].max_connections, 1024);
-        assert_eq!(parsed[0].connect_timeout_ms, 30_000);
-        for (field, value) in [
-            ("listen", serde_json::json!("127.0.0.1:0")),
-            ("connect_timeout_ms", serde_json::json!(0)),
-            ("max_connections", serde_json::json!(0)),
-            ("max_connections", serde_json::json!(65537)),
-            ("unknown", serde_json::json!(true)),
-        ] {
-            let mut invalid = config();
-            invalid[0][field] = value;
-            assert!(
-                parse_config(&serde_json::to_vec(&invalid).unwrap()).is_err(),
-                "{invalid}"
-            );
-        }
-        for (field, value) in [
-            ("port", serde_json::json!(0)),
-            ("script", serde_json::json!("")),
-            ("class_name", serde_json::json!("__D1Database")),
-            ("startup_path", serde_json::json!("//elsewhere/start")),
-            ("startup_path", serde_json::json!("/start?secret=yes")),
-            ("object_name", serde_json::json!("x".repeat(1025))),
-            (
-                "startup_path",
-                serde_json::json!(format!("/{}", "x".repeat(MAX_HANDSHAKE_BYTES))),
-            ),
-            ("unknown", serde_json::json!(true)),
-        ] {
-            let mut invalid = config();
-            invalid[0]["target"][field] = value;
-            assert!(
-                parse_config(&serde_json::to_vec(&invalid).unwrap()).is_err(),
-                "{invalid}"
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_listener_and_target_are_rejected() {
-        let mut configs = config();
-        let mut second = configs[0].clone();
-        second["listen"] = serde_json::json!("127.0.0.1:4544");
-        configs.as_array_mut().unwrap().push(second);
-        assert!(parse_config(&serde_json::to_vec(&configs).unwrap()).is_err());
-        configs[1]["listen"] = configs[0]["listen"].clone();
-        configs[1]["target"]["object_name"] = serde_json::json!("second");
-        assert!(parse_config(&serde_json::to_vec(&configs).unwrap()).is_err());
-        configs[1]["listen"] = serde_json::json!("127.0.0.1:4544");
-        assert!(parse_config(&serde_json::to_vec(&configs).unwrap()).is_ok());
-    }
 
     #[tokio::test]
     async fn raw_relay_preserves_server_first_bytes_and_half_close_under_backpressure() {

@@ -65,6 +65,7 @@ fn legacy_manifest_schema_version() -> u32 {
 pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1,
+    FEATURE_TCP_INGRESS_V1,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
     FEATURE_KV_V1,
@@ -76,6 +77,8 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+/// Deployment-owned TCP listeners require a node that applies their routes.
+pub const FEATURE_TCP_INGRESS_V1: &str = "tcp-ingress-v1";
 /// A deployment with `containers`. Required because a build without the
 /// container engine would load the manifest, build a `ctx` with no
 /// `container`, and fail only when the object first touches it.

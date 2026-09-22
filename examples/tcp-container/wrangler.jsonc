@@ -8,5 +8,13 @@
   "durable_objects": {
     "bindings": [{ "name": "ECHO", "class_name": "EchoContainer" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EchoContainer"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EchoContainer"] }],
+  "tcp": [
+    {
+      "listen_port": 4543,
+      "class_name": "EchoContainer",
+      "object_name": "primary",
+      "container_port": 7000
+    }
+  ]
 }

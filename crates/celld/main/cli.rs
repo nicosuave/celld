@@ -19,7 +19,6 @@ pub(crate) struct Settings {
     /// Whether forwarded scheme and host headers can set `request.url`.
     /// This option is off unless a trusted proxy replaces both headers.
     pub(crate) trust_forwarded_headers: bool,
-    pub(crate) tcp_ingress: Option<std::path::PathBuf>,
     /// Set only by the `celld dev` supervisor for its child node. No fleet
     /// flag or public environment variable selects the local backend.
     pub(crate) dev_store: Option<std::path::PathBuf>,
@@ -151,7 +150,6 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         advertise: configured_advertise,
         unsafe_public_advertise: celld::env_vars::flag("CELLD_UNSAFE_PUBLIC_ADVERTISE", false)?,
         trust_forwarded_headers: celld::env_vars::flag("CELLD_TRUST_FORWARDED_HEADERS", false)?,
-        tcp_ingress: env("CELLD_TCP_INGRESS_CONFIG").map(std::path::PathBuf::from),
         dev_store: if diagnose {
             None
         } else {
@@ -202,15 +200,6 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             }
             "--unsafe-public-advertise" => settings.unsafe_public_advertise = true,
             "--trust-forwarded-headers" => settings.trust_forwarded_headers = true,
-            "--tcp-ingress" if !diagnose => {
-                settings.tcp_ingress = Some(
-                    args.next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--tcp-ingress requires a JSON configuration file")
-                        })?
-                        .into(),
-                );
-            }
             "--peer" if diagnose => {
                 let peer = args
                     .next()
@@ -310,7 +299,6 @@ OPTIONS:
                          (default: 127.0.0.1:0)
   --advertise ADDR:PORT  Address peers can reach: IP:PORT or HOST:PORT
                          (requires --internal-listen or CELLD_INTERNAL_ADDR)
-  --tcp-ingress FILE     Opt-in TCP listener mappings (JSON; see Containers docs)
   --peer NODE_ID         Diagnose one node with a signed direct probe; repeatable
   --json                 Print one JSON object per diagnostic check
   --read-only            Skip the bucket write probe. celld diagnose otherwise
@@ -332,7 +320,6 @@ OPTIONS:
 ENVIRONMENT:
   Boolean variables accept only `0` or `1`; invalid values stop startup.
   CELLD_BUCKET                    Fleet bucket and prefix; same as --bucket
-  CELLD_TCP_INGRESS_CONFIG         TCP listener mappings file; same as --tcp-ingress
   S3_ENDPOINT                     S3-compatible endpoint; same as --endpoint
   AWS_REGION, AWS_DEFAULT_REGION  Storage region (default: us-east-1)
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN

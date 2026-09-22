@@ -1158,6 +1158,7 @@ impl Generation {
         let version = primary.version.clone();
         let prefix = primary.prefix.clone();
         let mut all_containers = Vec::new();
+        let mut tcp_routes = Vec::new();
         let mut fence_image = None;
         // Only classes the user declared can be a bare-id default. Every
         // runtime-supplied class rides in `do_classes` so that its namespace
@@ -1211,9 +1212,24 @@ impl Generation {
                 services,
                 crons,
                 containers,
+                tcp,
                 fence_image: fence,
                 ..
             } = deployment;
+            for route in tcp {
+                if tcp_routes
+                    .iter()
+                    .any(|(_, other): &(String, crate::tcp_config::TcpIngress)| {
+                        other.listen_port == route.listen_port
+                    })
+                {
+                    anyhow::bail!(
+                        "TCP listen_port {} is declared by multiple scripts",
+                        route.listen_port
+                    );
+                }
+                tcp_routes.push((script.clone(), route));
+            }
             all_containers.extend(containers.iter().cloned());
             fence_image = fence_image.or(fence);
             if let Some(resolver) = resolver {
@@ -1278,6 +1294,7 @@ impl Generation {
             default_do_class,
             assets,
             containers: all_containers,
+            tcp: tcp_routes,
             fence_image,
         })
     }

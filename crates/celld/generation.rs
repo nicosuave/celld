@@ -278,6 +278,7 @@ pub struct GenerationOptions {
 /// the application handle. They are private and reached through
 /// `RuntimeManager`, which hands out this struct only as a snapshot.
 pub struct Generation {
+    pub(crate) tcp: Vec<(String, crate::tcp_config::TcpIngress)>,
     pub(crate) id: GenerationId,
     pub(crate) version: String,
     pub(crate) prefix: String,
@@ -300,6 +301,10 @@ pub struct Generation {
 }
 
 impl Generation {
+    pub fn tcp_ingress(&self) -> &[(String, crate::tcp_config::TcpIngress)] {
+        &self.tcp
+    }
+
     pub fn id(&self) -> GenerationId {
         self.id
     }
