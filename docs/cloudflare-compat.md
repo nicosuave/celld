@@ -185,6 +185,30 @@ celld provides an always-miss cache because it has no shared edge cache.
 - celld does not block the destination ports that Cloudflare blocks. The fleet
   network controls the egress policy.
 
+### Inbound Socket Workers
+
+A Worker's `connect(socket, env, ctx)` handler receives an inbound TCP Socket.
+celld replaces Cloudflare Spectrum routing with deployment configuration:
+`"socket_workers": [{ "port": 5432 }]`. Each port routes to the node's primary
+Worker. These listeners use the HTTP listener's IP address and carry raw TCP;
+TLS termination belongs upstream. Service-binding targets do not open ports.
+Service bindings and Durable Object stubs expose `connect(address, options)`
+returning a Socket. A Durable Object handles it with `connect(socket)` or
+forwards it with `ctx.container.getTcpPort(port).connect(address)`. Accepted
+sockets keep their write side open after peer EOF, allowing final responses.
+See the [echo example](../examples/socket-worker/) for configuration and use.
+
+### gRPC
+
+Native gRPC requests on the HTTP/2 listener become binary gRPC-web requests
+inside `fetch()`. Binary gRPC-web responses become native gRPC responses with
+HTTP/2 trailers. Unary and server-streaming messages pass through without
+buffering the whole response. Outbound `fetch()` with a binary gRPC-web content
+type uses HTTP/2 and translates native response trailers into a gRPC-web frame;
+use `redirect: "manual"` as in Cloudflare's example, or `redirect: "error"`.
+Text/base64 gRPC-web is not translated. Bidirectional gRPC uses the raw TCP
+Socket Worker path to a server, including a server in a container.
+
 ### BroadcastChannel
 
 celld defines the class so that a bundle can load, but its constructor throws an

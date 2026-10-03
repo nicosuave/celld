@@ -25,16 +25,20 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
-trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
+pub trait TcpStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> TcpStream for T {}
 
-type Duplex = Box<dyn Stream>;
+pub type TcpConnection = Box<dyn TcpStream>;
+type Duplex = TcpConnection;
 type ReadHalf = tokio::io::ReadHalf<Duplex>;
 type WriteHalf = tokio::io::WriteHalf<Duplex>;
 
 struct TcpSocket {
     read: Arc<tokio::sync::Mutex<Option<ReadHalf>>>,
     write: Arc<tokio::sync::Mutex<Option<WriteHalf>>>,
+    opened: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    closed: tokio_util::sync::CancellationToken,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 fn registry() -> &'static Mutex<HashMap<u64, TcpSocket>> {
@@ -51,7 +55,17 @@ fn next_id() -> u64 {
 /// request context calls this for every socket the event opened, so an
 /// abandoned socket cannot outlive its event. Idempotent.
 pub(super) fn free(id: u64) {
-    registry().lock().unwrap().remove(&id);
+    if let Some(socket) = registry().lock().unwrap().remove(&id) {
+        socket.closed.cancel();
+        if let Some(cancel) = socket.cancel {
+            let _ = cancel.send(());
+        }
+        if let Some(opened) = socket.opened {
+            let _ = opened.send(Err(anyhow!(
+                "connect handler did not accept the connection"
+            )));
+        }
+    }
 }
 
 fn insert(id: u64, stream: Duplex) {
@@ -61,8 +75,32 @@ fn insert(id: u64, stream: Duplex) {
         TcpSocket {
             read: Arc::new(tokio::sync::Mutex::new(Some(read))),
             write: Arc::new(tokio::sync::Mutex::new(Some(write))),
+            opened: None,
+            closed: tokio_util::sync::CancellationToken::new(),
+            cancel: None,
         },
     );
+}
+
+pub(super) fn accept_connection(connection: RuntimeConnect) -> u64 {
+    let id = next_id();
+    current_context().tcp_sockets.lock().unwrap().push(id);
+    insert(id, connection.stream);
+    registry().lock().unwrap().get_mut(&id).unwrap().opened = Some(connection.opened);
+    id
+}
+
+pub(super) fn op_tcp_accept(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
+    if let Some(socket) = registry().lock().unwrap().get_mut(&id) {
+        if let Some(opened) = socket.opened.take() {
+            let _ = opened.send(Ok(()));
+        }
+    }
 }
 
 /// Mozilla's roots, the same choice `ws_client` makes and for the same
@@ -126,6 +164,78 @@ struct ConnectArgs {
     secure: bool,
     #[serde(default)]
     expected_host: Option<String>,
+}
+
+/// Binding destinations retain their routing authority; the address describes
+/// the connection and never becomes an unmediated network destination.
+pub(super) fn op_tcp_binding_connect(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let context = event_context(scope);
+    if let Err(error) = context.charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    let kind = args.get(0).to_rust_string_lossy(scope);
+    let target_name = args.get(1).to_rust_string_lossy(scope);
+    let name = args
+        .get(2)
+        .is_string()
+        .then(|| args.get(2).to_rust_string_lossy(scope));
+    let request: ConnectArgs = match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope))
+    {
+        Ok(request) => request,
+        Err(error) => return loader_throw(scope, &format!("connect(): {error}")),
+    };
+    let props = view_bytes(args.get(4)).unwrap_or_default();
+    let target = if kind == "cell" {
+        crate::host_channels::SocketTarget::Cell {
+            order: Some(enter_call_order(context.clone(), &target_name)),
+            parent: current_trace_context(scope),
+            scope: target_name,
+            name,
+        }
+    } else {
+        crate::host_channels::SocketTarget::Service {
+            script: target_name,
+            entrypoint: name.map(|name| crate::WorkerFetchEntrypoint { name, props }),
+        }
+    };
+    let id = next_id();
+    context.tcp_sockets.lock().unwrap().push(id);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Tcp);
+    let generation = current_generation(scope);
+    let async_id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (opened, ready) = tokio::sync::oneshot::channel();
+        let (cancel_sender, cancel) = tokio::sync::oneshot::channel();
+        let address = format!("{}:{}", request.hostname, request.port);
+        crate::host_channels::socket_call_tx()
+            .ok_or("no socket binding channel")?
+            .send(crate::host_channels::SocketCallReq {
+                cancel: Some(cancel),
+                generation,
+                target,
+                address: address.clone(),
+                stream: Box::new(server),
+                opened,
+            })
+            .map_err(|_| "socket binding channel closed")?;
+        ready
+            .await
+            .map_err(|_| "socket destination dropped before accepting")?
+            .map_err(|error| error.to_string())?;
+        let mut stream: Duplex = Box::new(client);
+        if request.secure {
+            stream = handshake(stream, request.hostname).await?;
+        }
+        insert(id, stream);
+        registry().lock().unwrap().get_mut(&id).unwrap().cancel = Some(cancel_sender);
+        Ok::<String, String>(serde_json::json!({"id": id, "remoteAddress": address}).to_string())
+    });
+    rv.set(promise_for(scope, async_id));
 }
 
 pub(super) fn op_tcp_connect(
@@ -197,18 +307,29 @@ pub(super) fn op_tcp_read(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let half = registry().lock().unwrap().get(&id).map(|s| s.read.clone());
+    let half = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|s| (s.read.clone(), s.closed.clone()));
     let async_id = asyncrt::enqueue(async move {
-        let half = half.ok_or("socket is closed")?;
-        let mut guard = half.lock().await;
-        let read = guard.as_mut().ok_or("socket is closed")?;
-        let mut buffer = vec![0u8; 16 * 1024];
-        let n = read
-            .read(&mut buffer)
-            .await
-            .map_err(|error| format!("read failed: {error}"))?;
-        buffer.truncate(n);
-        Ok::<Vec<u8>, String>(buffer)
+        let (half, closed) = half.ok_or("socket is closed")?;
+        let operation = async {
+            let mut guard = half.lock().await;
+            let read = guard.as_mut().ok_or("socket is closed")?;
+            let mut buffer = vec![0u8; 16 * 1024];
+            let n = read
+                .read(&mut buffer)
+                .await
+                .map_err(|error| format!("read failed: {error}"))?;
+            buffer.truncate(n);
+            Ok::<Vec<u8>, String>(buffer)
+        };
+        crate::asyncrt::select_biased! {
+            "closing a socket cancels pending I/O before releasing its stream";
+            _ = closed.cancelled() => Err("socket is closed".to_string()),
+            result = operation => result,
+        }
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -222,22 +343,33 @@ pub(super) fn op_tcp_write(
     let Some(bytes) = view_bytes(args.get(1)) else {
         return loader_throw(scope, "socket write needs bytes");
     };
-    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    let half = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|s| (s.write.clone(), s.closed.clone()));
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let half = half.ok_or("socket is closed")?;
-        let mut guard = half.lock().await;
-        let write = guard.as_mut().ok_or("socket is closed")?;
-        write
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("write failed: {error}"))?;
-        write
-            .flush()
-            .await
-            .map_err(|error| format!("flush failed: {error}"))?;
-        Ok::<String, String>(String::new())
+        let (half, closed) = half.ok_or("socket is closed")?;
+        let operation = async {
+            let mut guard = half.lock().await;
+            let write = guard.as_mut().ok_or("socket is closed")?;
+            write
+                .write_all(&bytes)
+                .await
+                .map_err(|error| format!("write failed: {error}"))?;
+            write
+                .flush()
+                .await
+                .map_err(|error| format!("flush failed: {error}"))?;
+            Ok::<String, String>(String::new())
+        };
+        crate::asyncrt::select_biased! {
+            "closing a socket cancels pending I/O before releasing its stream";
+            _ = closed.cancelled() => Err("socket is closed".to_string()),
+            result = operation => result,
+        }
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -248,18 +380,29 @@ pub(super) fn op_tcp_shutdown(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    let half = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|s| (s.write.clone(), s.closed.clone()));
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let half = half.ok_or("socket is closed")?;
-        let mut guard = half.lock().await;
-        let write = guard.as_mut().ok_or("socket is closed")?;
-        write
-            .shutdown()
-            .await
-            .map_err(|error| format!("shutdown failed: {error}"))?;
-        Ok::<String, String>(String::new())
+        let (half, closed) = half.ok_or("socket is closed")?;
+        let operation = async {
+            let mut guard = half.lock().await;
+            let write = guard.as_mut().ok_or("socket is closed")?;
+            write
+                .shutdown()
+                .await
+                .map_err(|error| format!("shutdown failed: {error}"))?;
+            Ok::<String, String>(String::new())
+        };
+        crate::asyncrt::select_biased! {
+            "closing a socket cancels pending I/O before releasing its stream";
+            _ = closed.cancelled() => Err("socket is closed".to_string()),
+            result = operation => result,
+        }
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -299,11 +442,15 @@ pub(super) fn op_tcp_starttls(
         // start, and make every later operation on the old id fail.
         let taken = registry().lock().unwrap().remove(&request.id);
         let socket = taken.ok_or("socket is closed")?;
+        // Upgrading transfers the binding's cancellation authority along with
+        // the stream; dropping it here would cancel the destination handler.
+        let cancel = socket.cancel;
         let read = socket.read.lock().await.take().ok_or("socket is closed")?;
         let write = socket.write.lock().await.take().ok_or("socket is closed")?;
         let stream = read.unsplit(write);
         let stream = handshake(stream, request.host).await?;
         insert(new_id, stream);
+        registry().lock().unwrap().get_mut(&new_id).unwrap().cancel = cancel;
         Ok::<String, String>(serde_json::json!({ "id": new_id }).to_string())
     });
     rv.set(promise_for(scope, async_id));

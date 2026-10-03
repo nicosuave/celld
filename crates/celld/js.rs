@@ -67,6 +67,7 @@ pub use crate::engine_api::RequestBody;
 pub use crate::engine_api::RequestId;
 pub use crate::engine_api::RpcData;
 pub use crate::engine_api::RpcOutcome;
+pub use crate::engine_api::RuntimeConnect;
 pub use crate::engine_api::WorkerConfigOptions;
 pub use crate::engine_api::WorkflowBinding;
 pub use crate::engine_api::WsTarget;
@@ -153,6 +154,7 @@ pub use crate::wake_entry::set_arm_gate;
 pub use crate::wake_entry::ArmGate;
 pub(crate) use crate::wake_entry::ArmGateRx;
 pub(crate) use crate::wake_entry::WakeEntryService;
+pub use tcp::{TcpConnection, TcpStream};
 
 #[cfg(all(test, celld_internal_tests))]
 fn test_host_services() -> Arc<crate::host_services::HostServices> {
@@ -583,6 +585,12 @@ pub enum AlarmDispatch {
 /// is a direct call on the isolate, because it is not an event and has no
 /// handler to run.
 pub enum CellJob {
+    Connect {
+        scope: String,
+        name: Option<String>,
+        connection: RuntimeConnect,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     Fetch {
         request_id: Option<RequestId>,
         scope: String,
@@ -656,7 +664,8 @@ impl CellJob {
     /// The cell this event addresses, which is also the realm it runs in.
     pub fn scope(&self) -> &str {
         match self {
-            CellJob::Fetch { scope, .. }
+            CellJob::Connect { scope, .. }
+            | CellJob::Fetch { scope, .. }
             | CellJob::Rpc { scope, .. }
             | CellJob::WsOpen { scope, .. }
             | CellJob::WsMessage { scope, .. }
@@ -670,6 +679,7 @@ impl CellJob {
     /// The client request that can cancel this event, when it is a fetch.
     pub(crate) fn request_id(&self) -> Option<RequestId> {
         match self {
+            CellJob::Connect { connection, .. } => connection.request_id,
             CellJob::Fetch { request_id, .. } => *request_id,
             _ => None,
         }
@@ -688,6 +698,7 @@ impl CellJob {
     /// wait on it and then release the call behind it.
     pub fn take_order(&mut self) -> Option<CallOrder> {
         match self {
+            CellJob::Connect { connection, .. } => connection.order.take(),
             CellJob::Fetch { order, .. } => order.take(),
             _ => None,
         }
@@ -696,6 +707,7 @@ impl CellJob {
     /// Fail this event without running it.
     pub fn fail(self, error: anyhow::Error) {
         match self {
+            CellJob::Connect { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Fetch { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Rpc { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsOpen { reply, .. } => drop(reply.send(Err(error))),
@@ -718,6 +730,16 @@ thread_local! {
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
     static HTTP_ERROR: reqwest::Client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("fetch redirect mode is error")
+        })).build().unwrap();
+    // Native gRPC requires HTTP/2. This selects h2c for HTTP and h2 ALPN for
+    // HTTPS; response bodies must retain their HTTP trailers until translated.
+    static HTTP_GRPC_MANUAL: reqwest::Client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    static HTTP_GRPC_ERROR: reqwest::Client = reqwest::Client::builder()
+        .http2_prior_knowledge()
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             attempt.error("fetch redirect mode is error")
         })).build().unwrap();
@@ -2913,6 +2935,7 @@ impl Drop for WorkerIsolate {
 /// budget — is identical, so the difference lives here rather than in two
 /// copies of `drive`.
 pub enum Answer {
+    Connect(tokio::sync::oneshot::Sender<Result<()>>),
     Fetch(tokio::sync::oneshot::Sender<Result<HttpResponse>>),
     Rpc(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
     Queue(tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>),
@@ -3030,6 +3053,7 @@ impl Answer {
         gates: Vec<ArmGateRx>,
     ) -> Option<GatedReplyRx> {
         match self {
+            Answer::Connect(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Fetch(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Rpc(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Queue(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
@@ -3345,6 +3369,7 @@ impl InFlight {
         }
         self.completed_cell_event = self.scope.is_some();
         let (background, gated_reply) = match reply {
+            Answer::Connect(reply) => send_and_end(tc, &self.context, reply, Ok(())),
             Answer::Fetch(reply) => {
                 // A value the decoder refuses is a failure in the turn like a
                 // throw is, so it carries the same positions.
@@ -4192,7 +4217,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Connect { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4512,6 +4537,13 @@ fn begin<'s>(
     job: crate::WorkerJob,
 ) -> Begun {
     let job = match job {
+        crate::WorkerJob::Connect {
+            entrypoint,
+            connection,
+            reply,
+        } => {
+            return begin_connect(tc, entrypoint, connection, reply);
+        }
         crate::WorkerJob::Rpc {
             entrypoint,
             operation,
@@ -4705,6 +4737,81 @@ fn begin_entrypoint_rpc(
                 request_id: None,
                 active_request_id: None,
                 reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: event_started,
+                trace: None,
+                failure: None,
+                tail_report: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+fn begin_connect(
+    tc: &mut v8::PinScope,
+    entrypoint: Option<crate::WorkerFetchEntrypoint>,
+    connection: RuntimeConnect,
+    reply: tokio::sync::oneshot::Sender<Result<()>>,
+) -> Begun {
+    let request_id = connection.request_id;
+    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
+    let started = (|| {
+        begin_event_context(tc)?;
+        let entrypoint = entrypoint.unwrap_or(crate::WorkerFetchEntrypoint {
+            name: "default".to_string(),
+            props: Vec::new(),
+        });
+        let f = internal_function(tc, "__dispatchEntrypointConnect")?;
+        let address = connection.address.clone();
+        let id = tcp::accept_connection(connection);
+        let arguments = [
+            v8::String::new(tc, &entrypoint.name).unwrap().into(),
+            v8::Number::new(tc, id as f64).into(),
+            v8::String::new(tc, &address).unwrap().into(),
+            bytes_value(tc, entrypoint.props),
+        ];
+        let recv = v8::undefined(tc).into();
+        let ret = f
+            .call(tc, recv, &arguments)
+            .ok_or_else(|| anyhow!("connect handler threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    let event_started = Instant::now();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id,
+                active_request_id: None,
+                reply: Some(Answer::Connect(reply)),
                 gated_reply: None,
                 background: None,
                 completed_cell_event: false,
@@ -5211,6 +5318,39 @@ fn start_cell_event<'s>(
 /// than by nesting.
 fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
     match job {
+        CellJob::Connect {
+            scope,
+            name,
+            connection,
+            reply,
+        } => {
+            if let Err(error) = register_actor_name(tc, &scope, name.as_deref()) {
+                let _ = reply.send(Err(error));
+                return Begun::Nothing;
+            }
+            let request_id = connection.request_id;
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::Connect(reply),
+                request_id,
+                None,
+                false,
+                |tc| {
+                    let f = internal_function(tc, "__dispatchConnectTo")?;
+                    let address = connection.address.clone();
+                    let id = tcp::accept_connection(connection);
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::Number::new(tc, id as f64).into(),
+                        v8::String::new(tc, &address).unwrap().into(),
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("connect handler threw"))
+                },
+            )
+        }
         CellJob::Fetch {
             request_id,
             scope,
@@ -5900,12 +6040,38 @@ impl Worker {
             // tell the harness which cells are local (route the rest cross-node)
             inject_routing(scope, node)?;
 
-            // entry fetch. A loaded Worker often exists for its Durable
-            // Object class alone, and workerd loads such a module without a
-            // default export, so one reads as an empty object here. A
-            // deployment's own script keeps the refusal: a bundle that lost
-            // its handler must fail adoption, so the serving generation stays
-            // up instead of answering 500 to every request.
+            // Socket Workers can expose only connect(), including through a
+            // named entrypoint. They still load an explicit missing-fetch
+            // handler so accidental HTTP dispatch fails at the API boundary.
+            let connect_key = v8::String::new(scope, "connect").unwrap();
+            let mut has_connect_handler = false;
+            for index in 0..names.length() {
+                let name = names.get_index(scope, index).unwrap();
+                let value = ns.get(scope, name).unwrap();
+                let Some(export) = value.to_object(scope) else {
+                    continue;
+                };
+                let handler = if export.is_function() {
+                    let name = name.to_rust_string_lossy(scope);
+                    if !cell_registry_has(scope, "entrypoints", &name)? {
+                        continue;
+                    }
+                    let prototype_key = v8::String::new(scope, "prototype").unwrap();
+                    export
+                        .get(scope, prototype_key.into())
+                        .and_then(|prototype| prototype.to_object(scope))
+                        .and_then(|prototype| prototype.get(scope, connect_key.into()))
+                } else {
+                    export.get(scope, connect_key.into())
+                };
+                if handler.is_some_and(|handler| handler.is_function()) {
+                    has_connect_handler = true;
+                    break;
+                }
+            }
+            // Dynamic Workers may also exist for their Durable Object class
+            // alone. Other deployed scripts retain the handler check so a
+            // broken HTTP bundle cannot silently replace the serving one.
             let loaded = config.origin == WorkerOrigin::Dynamic;
             let dk = v8::String::new(scope, "default").unwrap();
             let default_value = ns
@@ -5913,7 +6079,7 @@ impl Worker {
                 .ok_or_else(|| anyhow!("no default export"))?;
             let default = if default_value.is_object() {
                 default_value.to_object(scope).expect("an object")
-            } else if loaded && default_value.is_undefined() {
+            } else if (loaded || has_connect_handler) && default_value.is_undefined() {
                 v8::Object::new(scope)
             } else {
                 return Err(anyhow!("default not object"));
@@ -5978,7 +6144,7 @@ impl Worker {
                     scope,
                     "(req) => __celld.__dispatchEntrypointFetch('default', req)",
                 )?
-            } else if loaded {
+            } else if loaded || has_connect_handler {
                 compile_fn(scope, NO_FETCH_HANDLER)?
             } else {
                 return Err(anyhow!("fetch not fn"));
@@ -6643,6 +6809,8 @@ ops! { OP_NAMES, install_op_functions,
         "__hr_take" => html_rewriter::op_hr_take,
         "__hr_free" => html_rewriter::op_hr_free,
         "__tcp_connect" => tcp::op_tcp_connect,
+        "__tcp_accept" => tcp::op_tcp_accept,
+        "__tcp_binding_connect" => tcp::op_tcp_binding_connect,
         "__tcp_read" => tcp::op_tcp_read,
         "__tcp_write" => tcp::op_tcp_write,
         "__tcp_shutdown" => tcp::op_tcp_shutdown,
@@ -8825,11 +8993,24 @@ fn op_fetch(
     }
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
-    let client = match redirect.as_str() {
-        "follow" if context.subrequest_limit.is_some() => context.redirect_counting_client(),
-        "follow" => HTTP.with(|client| client.clone()),
-        "manual" => HTTP_MANUAL.with(|client| client.clone()),
-        "error" => HTTP_ERROR.with(|client| client.clone()),
+    let grpc = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && crate::grpc::is_web_content_type(value)
+    });
+    if grpc && redirect == "follow" {
+        return loader_throw(
+            scope,
+            "fetch: gRPC-web translation requires redirect mode manual or error",
+        );
+    }
+    let client = match (grpc, redirect.as_str()) {
+        (true, "manual") => HTTP_GRPC_MANUAL.with(|client| client.clone()),
+        (true, "error") => HTTP_GRPC_ERROR.with(|client| client.clone()),
+        (false, "follow") if context.subrequest_limit.is_some() => {
+            context.redirect_counting_client()
+        }
+        (false, "follow") => HTTP.with(|client| client.clone()),
+        (false, "manual") => HTTP_MANUAL.with(|client| client.clone()),
+        (false, "error") => HTTP_ERROR.with(|client| client.clone()),
         _ => unreachable!("the redirect mode was validated above"),
     };
     // The creating context, read here while JS is still running: the op
@@ -8922,8 +9103,25 @@ fn op_fetch(
                 name.eq_ignore_ascii_case("content-length")
                     || name.eq_ignore_ascii_case("transfer-encoding")
             });
-        for (name, value) in headers {
-            rb = rb.header(name, value);
+        if grpc {
+            let mut wire_headers = hyper::HeaderMap::new();
+            for (name, value) in headers {
+                let parsed = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .ok()
+                    .zip(hyper::header::HeaderValue::from_str(&value).ok());
+                let Some((name, value)) = parsed else {
+                    let error = "fetch: invalid gRPC-web request header".to_string();
+                    finish(false, None, Some(error.clone()));
+                    return Err(error);
+                };
+                wire_headers.append(name, value);
+            }
+            crate::grpc::request_to_native(&mut wire_headers);
+            rb = rb.headers(wire_headers);
+        } else {
+            for (name, value) in headers {
+                rb = rb.header(name, value);
+            }
         }
         if let Some(body) = body {
             rb = match body {
@@ -8962,8 +9160,28 @@ fn op_fetch(
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let headers = resp
-                    .headers()
+                let translate = grpc
+                    && resp
+                        .headers()
+                        .get(hyper::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(crate::grpc::is_native_content_type);
+                let (response_headers, source) = if translate {
+                    use futures_util::StreamExt as _;
+                    use http_body_util::BodyExt as _;
+                    let response: hyper::Response<reqwest::Body> = resp.into();
+                    let response = crate::grpc::native_response_to_web(response);
+                    let (parts, body) = response.into_parts();
+                    let stream = body.into_data_stream().map(|chunk| {
+                        chunk
+                            .map(|bytes| bytes.to_vec())
+                            .map_err(|error| error.to_string())
+                    });
+                    (parts.headers, HttpStreamSource::Stream(Box::pin(stream)))
+                } else {
+                    (resp.headers().clone(), HttpStreamSource::Response(resp))
+                };
+                let headers = response_headers
                     .iter()
                     .map(|(name, value)| {
                         (
@@ -8974,9 +9192,7 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
-                let Some(stream_id) =
-                    stream_service.register_source(HttpStreamSource::Response(resp))
-                else {
+                let Some(stream_id) = stream_service.register_source(source) else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
                     finish(false, Some(status), Some(error.clone()));
                     return Err(error);

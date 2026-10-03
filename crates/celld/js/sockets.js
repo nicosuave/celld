@@ -64,6 +64,8 @@
       this._id = null;
       this._closing = false;
       this._detached = false;
+      this._readEnded = false;
+      this._writeEnded = false;
       let resolveClosed, rejectClosed;
       this._closed = new Promise((resolve, reject) => {
         resolveClosed = resolve;
@@ -100,10 +102,12 @@
             return;
           }
           if (bytes.byteLength === 0) {
+            socket._readEnded = true;
             controller.close();
             // EOF closes the write side too unless the application
             // asked for a half-open socket.
             if (!socket._allowHalfOpen) await socket._eofClose();
+            else socket._finishIfDrained();
             return;
           }
           controller.enqueue(bytes);
@@ -123,7 +127,10 @@
         },
         async close() {
           await socket._opened;
-          if (!socket._detached) await __tcp_shutdown(socket._id);
+          if (!socket._detached && !socket._closing)
+            await __tcp_shutdown(socket._id);
+          socket._writeEnded = true;
+          socket._finishIfDrained();
         },
         abort() {},
       });
@@ -148,6 +155,13 @@
         writer.releaseLock();
       } catch { /* already closed or locked; closing wins either way */ }
       this._finishClose();
+    }
+
+    _finishIfDrained() {
+      // WritableStream runs close only after queued writes finish. Requiring
+      // read EOF as well preserves responses sent after the peer's FIN.
+      if (this._readEnded && this._writeEnded && !this._detached)
+        this._finishClose();
     }
 
     _finishClose() {
@@ -225,6 +239,21 @@
       allowHalfOpen,
       secureTransport === "starttls" ? { hostname } : null,
     );
+  };
+
+  // An inbound FIN ends the request bytes, not the response: a handler may
+  // finish reading before producing its reply, or still be draining a proxy.
+  __celld.__incomingSocket = (id, address) => new Socket(
+    Promise.resolve({ id, remoteAddress: address }), "off", true, null);
+
+  __celld.__bindingConnect = (kind, target, entrypoint, address, options, props) => {
+    const { hostname, port } = parseAddress(address);
+    const secureTransport = parseSecureTransport(options);
+    const opening = __tcp_binding_connect(kind, target, entrypoint,
+      JSON.stringify({ hostname, port, secure: secureTransport === "on" }), props)
+      .then((raw) => JSON.parse(raw));
+    return new Socket(opening, secureTransport, !!options?.allowHalfOpen,
+      secureTransport === "starttls" ? { hostname } : null);
   };
 
   __celld.__cfSockets = { connect };

@@ -283,6 +283,7 @@ pub struct Generation {
     pub(crate) version: String,
     pub(crate) prefix: String,
     pub(crate) script_name: String,
+    socket_workers: Vec<crate::protocol::SocketWorkerConfig>,
     pub(crate) stateless: crate::runtime::StatelessRuntime,
     pub(crate) services: HashMap<String, crate::runtime::StatelessRuntime>,
     pub(crate) cell_configs: HashMap<String, Arc<WorkerConfig>>,
@@ -301,6 +302,11 @@ pub struct Generation {
 }
 
 impl Generation {
+    /// TCP ports owned by the primary deployment; service targets do not bind ports.
+    pub fn socket_workers(&self) -> &[crate::protocol::SocketWorkerConfig] {
+        &self.socket_workers
+    }
+
     pub fn id(&self) -> GenerationId {
         self.id
     }
@@ -502,6 +508,7 @@ impl Generation {
         let node: Arc<str> = Arc::from(node);
         let region: Arc<str> = Arc::from(region);
         let primary_script = primary.script_name.clone();
+        let socket_workers = primary.socket_workers.clone();
         let version = primary.version.clone();
         let prefix = primary.prefix.clone();
         let mut all_containers = Vec::new();
@@ -624,6 +631,7 @@ impl Generation {
             default_do_class,
             assets,
             containers: all_containers,
+            socket_workers,
             fence_image,
         })
     }

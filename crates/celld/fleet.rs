@@ -777,6 +777,7 @@ async fn load_worker_at_pointer(
     }
     crate::protocol::validate_required_features(&manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
+    crate::protocol::validate_socket_worker_manifest(&manifest)?;
     // Old managed uploads can contain AI metadata without a required-feature
     // gate. Refuse it before loading code, rather than serve a missing binding.
     anyhow::ensure!(
@@ -928,6 +929,7 @@ async fn load_worker_at_pointer(
     let version = manifest.version.clone();
     let prefix = pointer.prefix.clone();
     let crons = manifest.crons.clone();
+    let socket_workers = manifest.socket_workers.clone();
     let containers = manifest.containers.clone();
     let fence_image = manifest.fence_image.clone();
     Ok(LoadedDeployment {
@@ -955,6 +957,7 @@ async fn load_worker_at_pointer(
         assets,
         services,
         crons,
+        socket_workers,
         containers,
         fence_image,
     })
@@ -974,6 +977,7 @@ pub struct LoadedDeployment {
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
+    pub socket_workers: Vec<crate::protocol::SocketWorkerConfig>,
     /// `containers` from the manifest: the classes whose cells supervise a
     /// container.
     pub containers: Vec<crate::container::ContainerSpec>,

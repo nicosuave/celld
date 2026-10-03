@@ -3515,6 +3515,10 @@ __celld.__makeLoader = () => {
 const __makeServiceBinding = __celld.__makeServiceBinding =
   (script, entrypoint = null, propsSc = undefined) => {
   const target = {
+  connect(address, options) {
+    return __celld.__bindingConnect("service", script, entrypoint,
+      address, options, propsSc);
+  },
   async fetch(input, init) {
     const req = new Request(input, init);
     const signal = req._signalForSubrequests;
@@ -4824,6 +4828,11 @@ const __entrypointStub = (name, props) => {
       if (prop === "getRpcMethodForTestOnly")
         return (n) => __makeNode(session, [String(n)], null);
       // A Fetcher's fetch() is an HTTP request, as a service binding's is.
+      if (prop === "connect")
+        return (address, options) => __makeServiceBinding(
+          __cell.script, name,
+          props === undefined ? undefined : __rpcOut(props, false),
+        ).connect(address, options);
       if (prop === "fetch")
         return (input, init) => __makeServiceBinding(
           __cell.script, name === "default" ? null : name,
@@ -5253,6 +5262,9 @@ class DurableObjectNamespace {
       if (prop === "then") return undefined;
       if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
       if (prop === "fetch") return doFetch;
+      if (prop === "connect") return (address, options) =>
+        __celld.__bindingConnect("cell", scope, dispatchName ?? null,
+          address, options);
       if (typeof prop !== "string") return undefined;
       if (__cell.compat.fetcherGetPutDelete &&
           (prop === "get" || prop === "put" || prop === "delete"))
@@ -5385,6 +5397,20 @@ const __dispatchTo = __celld.__dispatchTo = async (
     __endActorEvent(actorEvent);
   }
 };
+__celld.__dispatchConnectTo = async (scope, id, address) => {
+  const actorEvent = __beginActorEvent(scope);
+  try {
+    const inst = await _readyInstance(scope);
+    if (typeof inst.connect !== "function")
+      throw new TypeError("Durable Object has no connect handler");
+    const socket = __celld.__incomingSocket(id, address);
+    __tcp_accept(id);
+    return await __ctxRun(undefined, () => inst.connect(socket));
+  } finally {
+    __endActorEvent(actorEvent);
+  }
+};
+
 const __rpcTargetMethod = async (scope, method) => {
   const inst = await _readyInstance(scope);
   if (!inst.__celldState._rpcOk)
@@ -5529,6 +5555,18 @@ const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
     name, "fetch", request,
     propsSc === null || propsSc.length === 0
       ? undefined : __sc_decode(propsSc));
+__celld.__dispatchEntrypointConnect = async (name, id, address, propsSc) => {
+  const props = propsSc.length === 0 ? undefined : __sc_decode(propsSc);
+  const handler = __cell.objectEntrypoints[name];
+  const inst = handler ?? __newEntrypointInstance(name, props);
+  if (typeof inst.connect !== "function") throw __noHandler(name, "connect");
+  const socket = __celld.__incomingSocket(id, address);
+  __tcp_accept(id);
+  return await __ctxRun(undefined, () => handler !== undefined
+    ? handler.connect(socket, __cell.env, __entrypointContext())
+    : inst.connect(socket));
+};
+
 __celld.__dispatchEntrypointScheduled = (name, ctrl) =>
   __dispatchEntrypointMethod(name, "scheduled", ctrl);
 // A queue batch owns mutable settlement state only while its handler runs.
