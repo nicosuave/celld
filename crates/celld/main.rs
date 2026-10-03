@@ -35,7 +35,6 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Body as _, Bytes, Frame, Incoming};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -2262,10 +2261,11 @@ mod websocket;
 use websocket::{handle_websocket, outbound_websocket_task};
 
 async fn handle_ingress(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     app: AppHandle,
     connection: ConnectionWorkerRequests,
 ) -> HttpReply {
+    let grpc = celld::grpc::request_to_web(request.headers_mut());
     if matches!(*request.method(), hyper::Method::GET | hyper::Method::HEAD) {
         // One snapshot for the asset decision and the Worker it may fall
         // into, so a deployment adopted mid-request cannot serve the new
@@ -2307,7 +2307,7 @@ async fn handle_ingress(
         Err(response) => return *response,
     };
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
-    match app
+    let result = match app
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
@@ -2330,6 +2330,17 @@ async fn handle_ingress(
                 format!("Worker failed: {error:#}"),
             ),
         },
+    };
+    if grpc
+        && result
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(celld::grpc::is_web_content_type)
+    {
+        celld::grpc::web_response_to_native(result).map(BodyExt::boxed_unsync)
+    } else {
+        result
     }
 }
 
@@ -3223,14 +3234,16 @@ fn serve_http_connection(
                     }
                 }
             });
-            let connection = http1::Builder::new()
+            let mut builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            builder
+                .http1()
                 // Reclaim a connection that never sends a complete request
                 // head. The timeout also bounds an idle keep-alive waiting
                 // for its next request.
                 .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(std::time::Duration::from_secs(30))
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
+                .header_read_timeout(std::time::Duration::from_secs(30));
+            let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
             tokio::pin!(connection);
             let result = celld::asyncrt::select! {
                 result = &mut connection => Some(result),
@@ -3243,7 +3256,13 @@ fn serve_http_connection(
             };
             connection_requests.abort_all();
             match result {
-                Some(Err(error)) => record_connection_error(&error, surface, peer),
+                Some(Err(error)) => {
+                    if let Some(error) = error.downcast_ref::<hyper::Error>() {
+                        record_connection_error(error, surface, peer);
+                    } else {
+                        tracing::debug!(%error, "HTTP connection ended");
+                    }
+                }
                 None => tracing::warn!(
                     event = "connection_drain_forced",
                     grace_ms = connection_grace.as_millis(),

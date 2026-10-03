@@ -308,6 +308,7 @@ mod conformance_facet_failure_tests {
 pub mod assets;
 #[cfg(not(celld_internal_tests))]
 pub mod asyncrt;
+pub mod grpc;
 // The internal test flag alone selects the simulated asyncrt, so an external
 // test harness built with the flag sees the same simulated world the
 // in-crate suites see. `test` must not be part of the gate:

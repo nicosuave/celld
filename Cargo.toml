@@ -73,10 +73,10 @@ http-body-util = "0.1"
 # triggerable resource-exhaustion advisory. Keep a direct floor here because a
 # lockfile-only update does not preserve that security boundary when resolved.
 h2 = "0.4.18"
-hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 httpdate = "1"
 lol_html = "3.0"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 libc = "0.2"
 lz4_flex = { version = "0.11", features = ["frame"] }
 md-5 = "0.10"

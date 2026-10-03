@@ -733,6 +733,16 @@ thread_local! {
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             attempt.error("fetch redirect mode is error")
         })).build().unwrap();
+    // Native gRPC requires HTTP/2. This selects h2c for HTTP and h2 ALPN for
+    // HTTPS; response bodies must retain their HTTP trailers until translated.
+    static HTTP_GRPC_MANUAL: reqwest::Client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    static HTTP_GRPC_ERROR: reqwest::Client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("fetch redirect mode is error")
+        })).build().unwrap();
 }
 
 #[derive(Debug)]
@@ -8983,11 +8993,24 @@ fn op_fetch(
     }
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
-    let client = match redirect.as_str() {
-        "follow" if context.subrequest_limit.is_some() => context.redirect_counting_client(),
-        "follow" => HTTP.with(|client| client.clone()),
-        "manual" => HTTP_MANUAL.with(|client| client.clone()),
-        "error" => HTTP_ERROR.with(|client| client.clone()),
+    let grpc = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && crate::grpc::is_web_content_type(value)
+    });
+    if grpc && redirect == "follow" {
+        return loader_throw(
+            scope,
+            "fetch: gRPC-web translation requires redirect mode manual or error",
+        );
+    }
+    let client = match (grpc, redirect.as_str()) {
+        (true, "manual") => HTTP_GRPC_MANUAL.with(|client| client.clone()),
+        (true, "error") => HTTP_GRPC_ERROR.with(|client| client.clone()),
+        (false, "follow") if context.subrequest_limit.is_some() => {
+            context.redirect_counting_client()
+        }
+        (false, "follow") => HTTP.with(|client| client.clone()),
+        (false, "manual") => HTTP_MANUAL.with(|client| client.clone()),
+        (false, "error") => HTTP_ERROR.with(|client| client.clone()),
         _ => unreachable!("the redirect mode was validated above"),
     };
     // The creating context, read here while JS is still running: the op
@@ -9080,8 +9103,25 @@ fn op_fetch(
                 name.eq_ignore_ascii_case("content-length")
                     || name.eq_ignore_ascii_case("transfer-encoding")
             });
-        for (name, value) in headers {
-            rb = rb.header(name, value);
+        if grpc {
+            let mut wire_headers = hyper::HeaderMap::new();
+            for (name, value) in headers {
+                let parsed = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .ok()
+                    .zip(hyper::header::HeaderValue::from_str(&value).ok());
+                let Some((name, value)) = parsed else {
+                    let error = "fetch: invalid gRPC-web request header".to_string();
+                    finish(false, None, Some(error.clone()));
+                    return Err(error);
+                };
+                wire_headers.append(name, value);
+            }
+            crate::grpc::request_to_native(&mut wire_headers);
+            rb = rb.headers(wire_headers);
+        } else {
+            for (name, value) in headers {
+                rb = rb.header(name, value);
+            }
         }
         if let Some(body) = body {
             rb = match body {
@@ -9120,8 +9160,28 @@ fn op_fetch(
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let headers = resp
-                    .headers()
+                let translate = grpc
+                    && resp
+                        .headers()
+                        .get(hyper::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(crate::grpc::is_native_content_type);
+                let (response_headers, source) = if translate {
+                    use futures_util::StreamExt as _;
+                    use http_body_util::BodyExt as _;
+                    let response: hyper::Response<reqwest::Body> = resp.into();
+                    let response = crate::grpc::native_response_to_web(response);
+                    let (parts, body) = response.into_parts();
+                    let stream = body.into_data_stream().map(|chunk| {
+                        chunk
+                            .map(|bytes| bytes.to_vec())
+                            .map_err(|error| error.to_string())
+                    });
+                    (parts.headers, HttpStreamSource::Stream(Box::pin(stream)))
+                } else {
+                    (resp.headers().clone(), HttpStreamSource::Response(resp))
+                };
+                let headers = response_headers
                     .iter()
                     .map(|(name, value)| {
                         (
@@ -9132,9 +9192,7 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
-                let Some(stream_id) =
-                    stream_service.register_source(HttpStreamSource::Response(resp))
-                else {
+                let Some(stream_id) = stream_service.register_source(source) else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
                     finish(false, Some(status), Some(error.clone()));
                     return Err(error);

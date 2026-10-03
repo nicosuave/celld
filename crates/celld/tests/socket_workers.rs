@@ -1,10 +1,16 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Exercise the public binary, real isolates, ownership routing, and TCP lifecycle.
+//! Exercise the public binary, real isolates, ownership routing, and HTTP/2.
 // These tests own real host processes, files, and deadlines outside the actor.
 #![allow(clippy::disallowed_methods)]
+use bytes::Bytes;
+use futures_util::stream;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::{body::Frame, service::service_fn, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as PortReservation};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -43,7 +49,19 @@ export default {
   },
   async fetch(request, env) {
     if (new URL(request.url).pathname === '/warm') return env.DO.getByName('my-server').fetch(request);
-    return new Response('not found', {status: 404});
+    if (env.ORIGIN) return fetch(env.ORIGIN, {
+      method: 'POST', headers: request.headers, body: request.body, redirect: 'manual',
+    });
+    if (request.headers.get('content-type') !== 'application/grpc-web+proto') return new Response('incorrect content type', {status: 400});
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    const trailers = new TextEncoder().encode('grpc-status: 7\r\ngrpc-message: denied\r\n');
+    const trailerFrame = new Uint8Array(5 + trailers.length);
+    trailerFrame[0] = 128;
+    new DataView(trailerFrame.buffer).setUint32(1, trailers.length);
+    trailerFrame.set(trailers, 5);
+    return new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(bytes); controller.enqueue(trailerFrame); controller.close();
+    }}), {headers: {'content-type': 'application/grpc-web+proto'}});
   },
 };
 "#;
@@ -352,6 +370,89 @@ async fn tcp_worker_service_and_remote_durable_object_with_listener_reload() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_grpc_through_worker_and_outbound_http2_translation() {
+    init_host();
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("objects.sqlite3");
+    let store = celld::dev::open_local_bucket(&database).unwrap();
+    celld::wake_format::ensure_ready(&store).await.unwrap();
+    deploy_service(&directory.path().join("service"), &store).await;
+    deploy(directory.path(), &store, free_port(), "echo", "").await;
+    let node = start_node(directory.path(), &database, "127.0.0.1", "grpc-node").await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let data = Bytes::from_static(&[0, 0, 0, 0, 3, 1, 2, 3]);
+    let url = format!("http://{}/hello.Greeter/SayHello", node.public);
+    let reply = client
+        .post(&url)
+        .header("content-type", "application/grpc+proto")
+        .body(data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.version(), hyper::Version::HTTP_2);
+    assert_eq!(reply.headers()["content-type"], "application/grpc+proto");
+    let reply: Response<reqwest::Body> = reply.into();
+    let collected = reply.into_body().collect().await.unwrap();
+    assert_eq!(collected.trailers().unwrap()["grpc-status"], "7");
+    assert_eq!(collected.to_bytes(), data);
+
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = origin.accept().await.unwrap();
+        let service = service_fn(
+            |request: hyper::Request<hyper::body::Incoming>| async move {
+                assert_eq!(request.version(), hyper::Version::HTTP_2);
+                assert_eq!(request.headers()["content-type"], "application/grpc+proto");
+                let data = request.into_body().collect().await.unwrap().to_bytes();
+                let mut trailers = hyper::HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().unwrap());
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header("content-type", "application/grpc+proto")
+                        .body(StreamBody::new(stream::iter(vec![
+                            Ok::<_, Infallible>(Frame::data(data)),
+                            Ok(Frame::trailers(trailers)),
+                        ])))
+                        .unwrap(),
+                )
+            },
+        );
+        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(socket), service)
+            .await
+            .unwrap();
+    });
+    deploy(
+        directory.path(),
+        &store,
+        free_port(),
+        "echo",
+        &format!("http://{origin_address}/rpc"),
+    )
+    .await;
+    assert!(reload(&node).await.status().is_success());
+    let reply = client
+        .post(url)
+        .header("content-type", "application/grpc+proto")
+        .body(data.clone())
+        .send()
+        .await
+        .unwrap();
+    let reply: Response<reqwest::Body> = reply.into();
+    let collected = tokio::time::timeout(Duration::from_secs(5), reply.into_body().collect())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(collected.trailers().unwrap()["grpc-status"], "0");
+    assert_eq!(collected.to_bytes(), data);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
