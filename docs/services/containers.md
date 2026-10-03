@@ -102,7 +102,7 @@ class.
 
 Cloudflare runs each container in its own virtual machine, so Cloudflare
 publishes no capability policy. Under the default runtime a celld container
-shares the node's kernel, so celld sets a policy of its own. celld drops all
+shares the node's kernel, so celld sets a policy of its own. By default celld drops all
 Linux capabilities, sets `no-new-privileges`, keeps the daemon's default seccomp
 profile, limits the container to 1024 processes, and runs an init as PID 1 that
 reaps an orphaned process. Two containers on one node cannot open connections to
@@ -142,6 +142,98 @@ the container engine's built-in resolver, so a container under gVisor resolves
 no hostname otherwise, and the fence permits the public resolver. A container on
 the node's default runtime keeps the engine's resolver, unless the operator sets
 `CELLD_CONTAINER_DNS`.
+
+## FUSE mounts
+
+A class that needs a userspace filesystem can opt in through its deployment:
+
+```jsonc
+"containers": [{
+  "class_name": "MountedData",
+  "image": "./Dockerfile",
+  "instance_type": "basic",
+  "runtime": "runsc",
+  "fuse": true
+}]
+```
+
+`fuse` is a celld extension, defaults to `false`, and must be a boolean. It is
+owned by the deployment, not a `container.start()` option. FUSE requires the
+effective runtime to be explicitly named `runsc` (gVisor) or `kata` (Kata
+Containers). Set `runtime` on the class, or set `CELLD_CONTAINER_RUNTIME` on the
+node; the class setting takes precedence. The implicit daemon default, `runc`,
+other runtimes, and aliases are rejected before container creation. These names
+must be registered with the daemon and configured by a trusted operator to run
+the corresponding isolation runtime; their names alone do not attest isolation.
+
+The manifest requires `containers-fuse-v2`, so older nodes reject the deployment
+instead of applying the earlier unrestricted FUSE permission. Existing FUSE
+containers are adopted only if their recorded runtime matches the selected
+supported runtime.
+
+Each opted-in container gets `SYS_ADMIN` while retaining `CapDrop: ALL`,
+`no-new-privileges`, the daemon's seccomp policy, and existing process, resource,
+and network limits. celld never sets `Privileged`. With `runsc`, gVisor supplies
+its own in-sandbox `/dev/fuse`; celld does not pass a host FUSE device. With
+`kata`, celld requests `/dev/fuse` with read/write access through the daemon's
+device configuration; the guest kernel and runtime must provide working FUSE.
+The daemon must run Linux and register the selected runtime. Missing or unknown
+daemon security metadata fails closed.
+
+`SYS_ADMIN` permits more than FUSE inside the sandbox. On an AppArmor daemon,
+celld sets `apparmor=unconfined` for the opted-in container because Docker's
+default AppArmor profile denies mounting. This removes that AppArmor layer;
+the selected runtime remains the required isolation boundary. celld does not
+disable seccomp or SELinux, load kernel modules, or reconfigure the daemon.
+Do not put mutually distrusting workloads in one Kata VM/sandbox.
+
+Runtime eligibility is not a claim of tested filesystem compatibility. Qualify
+the exact runtime version and image before use, especially TigrisFS. A create or
+start failure includes the FUSE prerequisites and underlying daemon error; a
+mount process failure surfaces through its exit status and container logs. Run
+the [credential-free regression](../../tests/container-fuse) on each target
+runtime to check actual mount/read/write/unmount behavior.
+
+### TigrisFS with R2
+
+Install the ordinary [TigrisFS release](https://github.com/tigrisdata/tigrisfs)
+for the image's Linux architecture, plus the FUSE userspace utilities and CA
+certificates. Run the mount process as root in the container: celld keeps
+`no-new-privileges`, so a non-root process cannot use a setuid `fusermount`
+helper to gain mount privileges. Start the container with secrets supplied by
+the Worker:
+
+```js
+this.ctx.container.start({
+  enableInternet: true,
+  env: {
+    AWS_ACCESS_KEY_ID: this.env.AWS_ACCESS_KEY_ID,
+    AWS_SECRET_ACCESS_KEY: this.env.AWS_SECRET_ACCESS_KEY,
+    R2_ACCOUNT_ID: this.env.R2_ACCOUNT_ID,
+    R2_BUCKET_NAME: this.env.R2_BUCKET_NAME,
+  },
+});
+await this.ctx.container.monitor();
+```
+
+Use bucket-scoped credentials and keep them out of the image and deployment
+config. The image's startup script can start a read-only mount:
+
+```sh
+mkdir -p /mnt/data
+tigrisfs --endpoint "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+  --region auto -o ro -f "$R2_BUCKET_NAME" /mnt/data &
+fuse_pid=$!
+```
+
+Before starting the application, wait for `mountpoint -q /mnt/data` with a
+bounded timeout and check that the FUSE process is still alive. Keep it running
+for the application's lifetime, and unmount before exiting. The
+[Cloudflare FUSE example](https://developers.cloudflare.com/containers/examples/r2-fuse-mount/)
+shows a complete image and startup script; use celld's class config and start
+API above. The mount is recreated after a container restart. Object storage
+through FUSE does not supply full POSIX or local-disk semantics; this permission
+does not make a live writable database file on an object-store mount safe.
 
 ## Sleep, wake, and the node's resources
 
@@ -185,8 +277,8 @@ enforces no fleet cap.
 ## Differences from Cloudflare
 
 - A `containers` entry accepts `class_name`, `image`, `name`, `instance_type`,
-  `max_instances`, and `runtime`. Each other key stops the deployment. celld
-  adds `runtime`, and it accepts `name` without using it.
+  `max_instances`, `runtime`, and `fuse`. Each other key stops the deployment.
+  celld adds `runtime` and `fuse`, and it accepts `name` without using it.
 - celld places a container on the node that owns the cell. Cloudflare can place
   a container away from its object.
 - A node that serves a container class needs a Docker daemon or a Podman daemon.

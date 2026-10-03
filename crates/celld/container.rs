@@ -55,6 +55,71 @@ pub struct ContainerSpec {
     /// Cloudflare config here, which has no per-class runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Deployment-owned permission to mount FUSE filesystems. Never enabled
+    /// by a Worker at `start()`: this exposes a device and widens the kernel
+    /// security boundary of every container of this class.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fuse: bool,
+}
+
+/// Resolve only explicitly selected isolation runtimes, preserving class precedence.
+pub(crate) fn fuse_runtime(
+    class_runtime: Option<&str>,
+    node_runtime: Option<&str>,
+) -> anyhow::Result<&'static str> {
+    match class_runtime.or(node_runtime) {
+        Some("runsc") => Ok("runsc"),
+        Some("kata") => Ok("kata"),
+        runtime => Err(anyhow!(
+            "FUSE requires runtime `runsc` (gVisor) or `kata` (Kata Containers); selected {runtime:?}. \
+             Set containers[].runtime or CELLD_CONTAINER_RUNTIME; the daemon default is not allowed"
+        )),
+    }
+}
+
+/// Apply the explicit FUSE exception to the otherwise restricted policy.
+/// Docker's default seccomp profile admits mount/umount with SYS_ADMIN;
+/// docker-default AppArmor denies mount even with that capability.
+fn configure_fuse(
+    host_config: &mut Value,
+    daemon_info: &Value,
+    runtime: &str,
+) -> anyhow::Result<()> {
+    let runtime = fuse_runtime(Some(runtime), None)?;
+    anyhow::ensure!(
+        daemon_info.get("OSType").and_then(Value::as_str) == Some("linux"),
+        "FUSE requires a Linux container daemon reporting OSType=linux"
+    );
+    anyhow::ensure!(
+        daemon_info
+            .get("Runtimes")
+            .and_then(Value::as_object)
+            .is_some_and(|runtimes| runtimes.contains_key(runtime)),
+        "FUSE runtime `{runtime}` is not registered with the container daemon"
+    );
+    let security = daemon_info
+        .get("SecurityOptions")
+        .and_then(Value::as_array)
+        .filter(|options| options.iter().all(Value::is_string))
+        .ok_or_else(|| anyhow!("container daemon did not report SecurityOptions; cannot select a FUSE mount policy"))?;
+    host_config["CapAdd"] = json!(["SYS_ADMIN"]);
+    if runtime == "kata" {
+        host_config["Devices"] = json!([{
+            "PathOnHost": "/dev/fuse",
+            "PathInContainer": "/dev/fuse",
+            "CgroupPermissions": "rw",
+        }]);
+    }
+    // runsc supplies its own in-sandbox /dev/fuse, not a host device.
+    if security.iter().any(|option| {
+        option.as_str().is_some_and(|option| {
+            option == "apparmor" || option.split(',').any(|part| part == "name=apparmor")
+        })
+    }) {
+        // Scoped to this opted-in container, never a daemon-wide change.
+        host_config["SecurityOpt"] = json!(["no-new-privileges", "apparmor=unconfined"]);
+    }
+    Ok(())
 }
 
 /// The reference every engine holds an image under, from its content key.
@@ -905,6 +970,13 @@ impl ContainerEngine {
             .pointer("/State/Running")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if running && cell.spec.fuse {
+            let expected = fuse_runtime(cell.spec.runtime.as_deref(), self.runtime.as_deref())?;
+            anyhow::ensure!(
+                info.pointer("/HostConfig/Runtime").and_then(Value::as_str) == Some(expected),
+                "refusing to adopt FUSE container outside its selected `{expected}` runtime"
+            );
+        }
         Ok(running.then(|| address_of(&info)))
     }
 
@@ -920,7 +992,18 @@ impl ContainerEngine {
         run: u64,
         params: StartParams,
     ) -> anyhow::Result<()> {
-        let started = self.create_and_start(cell, params).await;
+        let started = self.create_and_start(cell, params).await.map_err(|error| {
+            if cell.spec.fuse {
+                error.context(format!(
+                    "FUSE container class {:?} could not start: select a registered runsc or kata \
+                     runtime with in-sandbox FUSE support and SYS_ADMIN; \
+                     check the daemon's device, seccomp and LSM policies",
+                    cell.spec.class_name
+                ))
+            } else {
+                error
+            }
+        });
         let address = match started {
             Ok(address) => address,
             Err(error) => {
@@ -991,6 +1074,19 @@ impl ContainerEngine {
         cell: &CellContainer,
         params: StartParams,
     ) -> anyhow::Result<Address> {
+        let runtime = cell.spec.runtime.as_deref().or(self.runtime.as_deref());
+        let mut fuse_policy = json!({});
+        if cell.spec.fuse {
+            let runtime = fuse_runtime(cell.spec.runtime.as_deref(), self.runtime.as_deref())?;
+            // Inspect before any creation/removal side effects. Never fall
+            // back to the default runtime when registration is missing.
+            let info = self
+                .docker
+                .expect("GET", "/info", None, "inspect daemon for FUSE support")
+                .await?
+                .json()?;
+            configure_fuse(&mut fuse_policy, &info, runtime)?;
+        }
         self.ensure_fence().await?;
         self.enforce_instance_ceiling(cell).await?;
         self.ensure_image(&cell.spec.image).await?;
@@ -1033,10 +1129,10 @@ impl ContainerEngine {
             );
         }
         // A container is a tenant's process tree, not the operator's: no
-        // capability, no privilege gain through setuid binaries, the
-        // daemon's seccomp profile, and a process ceiling. What a class
-        // legitimately needs beyond this is a config question for later,
-        // not a default. The kernel boundary itself is the runtime's.
+        // capability by default, no privilege gain through setuid binaries,
+        // the daemon's seccomp profile, and a process ceiling. Only a class
+        // whose deployment explicitly permits FUSE widens this policy.
+        // The kernel boundary itself is the runtime's.
         let mut host_config = json!({
             "NetworkMode": if offline { &internal } else { &open },
             "PublishAllPorts": !cfg!(target_os = "linux"),
@@ -1049,16 +1145,15 @@ impl ContainerEngine {
             // fork bomb left exactly these behind.
             "Init": true,
         });
+        host_config
+            .as_object_mut()
+            .unwrap()
+            .extend(fuse_policy.as_object().unwrap().clone());
         // A class can name its own runtime, else the node default. A class
         // that needs isolation names `runsc`, and the node's daemon must
         // have it or the start fails, so the class runs only where its
         // isolation is real.
-        let runtime = cell
-            .spec
-            .runtime
-            .as_deref()
-            .or(self.runtime.as_deref())
-            .filter(|runtime| !runtime.is_empty());
+        let runtime = runtime.filter(|runtime| !runtime.is_empty());
         if let Some(runtime) = runtime {
             host_config["Runtime"] = json!(runtime);
         }
@@ -1585,4 +1680,110 @@ fn container_name(node: &str, scope: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
     format!("celld-{:x}", digest)[..30].to_string()
+}
+
+#[cfg(test)]
+mod fuse_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_specs_keep_fuse_disabled_and_round_trip_without_it() {
+        let legacy = json!({"class_name": "Default", "image": "image"});
+        let spec: ContainerSpec = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!spec.fuse);
+        assert_eq!(serde_json::to_value(spec).unwrap(), legacy);
+    }
+
+    #[test]
+    fn fuse_requires_supported_effective_runtime_and_respects_class_override() {
+        for runtime in ["runsc", "kata"] {
+            assert_eq!(fuse_runtime(Some(runtime), None).unwrap(), runtime);
+            assert_eq!(fuse_runtime(None, Some(runtime)).unwrap(), runtime);
+            assert_eq!(fuse_runtime(Some(runtime), Some("runc")).unwrap(), runtime);
+        }
+        assert_eq!(fuse_runtime(Some("kata"), Some("runsc")).unwrap(), "kata");
+        assert!(fuse_runtime(None, None).is_err());
+        for runtime in ["runc", "", "gvisor", "kata-qemu", "unknown"] {
+            assert!(fuse_runtime(Some(runtime), Some("runsc")).is_err());
+            assert!(fuse_runtime(None, Some(runtime)).is_err());
+            let mut host = json!({});
+            assert!(configure_fuse(&mut host, &json!({}), runtime).is_err());
+            assert_eq!(host, json!({}));
+        }
+    }
+
+    #[test]
+    fn fuse_mount_policy_preserves_restrictions_and_handles_apparmor() {
+        for (security, apparmor) in [
+            (json!(["name=seccomp,profile=builtin"]), false),
+            (
+                json!(["name=apparmor", "name=seccomp,profile=builtin"]),
+                true,
+            ),
+            (json!(["apparmor"]), true),
+        ] {
+            let mut host = json!({
+                "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
+                "PidsLimit": 1024, "Runtime": "kata"
+            });
+            configure_fuse(
+                &mut host,
+                &json!({"OSType": "linux", "SecurityOptions": security, "Runtimes": {"kata": {}}}),
+                "kata",
+            )
+            .unwrap();
+            assert_eq!(host["CapDrop"], json!(["ALL"]));
+            assert_eq!(host["CapAdd"], json!(["SYS_ADMIN"]));
+            assert_eq!(
+                host["Devices"],
+                json!([{
+                    "PathOnHost": "/dev/fuse", "PathInContainer": "/dev/fuse", "CgroupPermissions": "rw"
+                }])
+            );
+            assert_eq!(host["Runtime"], "kata");
+            assert_eq!(host["PidsLimit"], 1024);
+            assert!(host.get("Privileged").is_none());
+            let expected = if apparmor {
+                json!(["no-new-privileges", "apparmor=unconfined"])
+            } else {
+                json!(["no-new-privileges"])
+            };
+            assert_eq!(host["SecurityOpt"], expected);
+        }
+    }
+
+    #[test]
+    fn runsc_uses_in_sandbox_fuse_without_host_device() {
+        let mut host =
+            json!({"CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"], "Runtime": "runsc"});
+        configure_fuse(
+            &mut host,
+            &json!({
+                "OSType": "linux", "SecurityOptions": [], "Runtimes": {"runsc": {}}
+            }),
+            "runsc",
+        )
+        .unwrap();
+        assert_eq!(host["CapAdd"], json!(["SYS_ADMIN"]));
+        assert!(host.get("Devices").is_none());
+        assert_eq!(host["SecurityOpt"], json!(["no-new-privileges"]));
+    }
+
+    #[test]
+    fn unsupported_or_unknown_daemon_policy_is_rejected_before_granting_fuse() {
+        for info in [
+            json!({"OSType": "windows", "SecurityOptions": []}),
+            json!({"SecurityOptions": []}),
+            json!({"OSType": "linux"}),
+            json!({"OSType": "linux", "SecurityOptions": [null]}),
+            json!({"OSType": "linux", "SecurityOptions": [], "Runtimes": {"runc": {}}}),
+            json!({"OSType": "linux", "SecurityOptions": []}),
+            json!({"OSType": "linux", "Runtimes": {"kata": {}}}),
+            json!({"OSType": "linux", "SecurityOptions": [null], "Runtimes": {"kata": {}}}),
+        ] {
+            let mut host = json!({});
+            assert!(configure_fuse(&mut host, &info, "kata").is_err());
+            assert_eq!(host, json!({}));
+        }
+    }
 }

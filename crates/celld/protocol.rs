@@ -65,6 +65,7 @@ fn legacy_manifest_schema_version() -> u32 {
 pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1,
+    FEATURE_CONTAINERS_FUSE_V2,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
     FEATURE_KV_V1,
@@ -81,6 +82,9 @@ pub const FEATURE_ASSETS_V1: &str = "assets-v1";
 /// container engine would load the manifest, build a `ctx` with no
 /// `container`, and fail only when the object first touches it.
 pub const FEATURE_CONTAINERS_V1: &str = "containers-v1";
+/// FUSE opt-in restricted to explicitly selected gVisor or Kata runtimes.
+/// Older nodes either ignore FUSE or allow it under shared-kernel runtimes.
+pub const FEATURE_CONTAINERS_FUSE_V2: &str = "containers-fuse-v2";
 /// A deployment with D1 databases. Required because a build without the
 /// reserved `__D1Database` class would load the manifest and then fail every
 /// `env.DB` call at request time, on a node the developer is not watching —

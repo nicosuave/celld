@@ -17,9 +17,9 @@ use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
-    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_FUSE_V2, FEATURE_CONTAINERS_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
+    FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -383,6 +383,8 @@ struct ContainerDecl {
     max_instances: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    fuse: bool,
 }
 
 struct ProjectAssets {
@@ -587,6 +589,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             instance_type: decl.instance_type.clone(),
             max_instances: decl.max_instances,
             runtime: decl.runtime.clone(),
+            fuse: decl.fuse,
         })
         .collect();
     if !container_specs.is_empty() {
@@ -696,6 +699,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if !container_specs.is_empty() {
                 features.push(FEATURE_CONTAINERS_V1.to_string());
+            }
+            if container_specs.iter().any(|spec| spec.fuse) {
+                features.push(FEATURE_CONTAINERS_FUSE_V2.to_string());
             }
             if uses_d1 {
                 features.push(FEATURE_D1_V1.to_string());
@@ -2106,7 +2112,13 @@ fn read_containers(
         if let Some(key) = entry.keys().find(|key| {
             !matches!(
                 key.as_str(),
-                "class_name" | "image" | "name" | "instance_type" | "max_instances" | "runtime"
+                "class_name"
+                    | "image"
+                    | "name"
+                    | "instance_type"
+                    | "max_instances"
+                    | "runtime"
+                    | "fuse"
             )
         }) {
             bail!("config `containers[{index}]` declares `{key}`, which celld does not model");
@@ -2184,6 +2196,19 @@ fn read_containers(
                     })
             })
             .transpose()?;
+        let fuse = entry
+            .get("fuse")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| anyhow!("config `containers[{index}].fuse` must be a boolean"))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if fuse && runtime.is_some() {
+            crate::container::fuse_runtime(runtime.as_deref(), None)
+                .with_context(|| format!("config `containers[{index}]`"))?;
+        }
         declared.push(ContainerDecl {
             class_name: class_name.to_string(),
             image: image.to_string(),
@@ -2191,6 +2216,7 @@ fn read_containers(
             instance_type,
             max_instances,
             runtime,
+            fuse,
         });
     }
     Ok(declared)
@@ -3001,4 +3027,53 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod container_fuse_tests {
+    use super::*;
+
+    #[test]
+    fn fuse_rejects_explicit_unsupported_runtime_but_allows_node_selection() {
+        let classes = vec!["Mounted".to_string()];
+        let mut config = json!({"containers": [
+            {"class_name": "Mounted", "image": "./Dockerfile", "fuse": true}
+        ]});
+        assert!(read_containers(config.as_object().unwrap(), &classes, &classes).is_ok());
+        for runtime in ["runsc", "kata"] {
+            config["containers"][0]["runtime"] = json!(runtime);
+            assert!(read_containers(config.as_object().unwrap(), &classes, &classes).is_ok());
+        }
+        for runtime in ["runc", "kata-qemu", "unknown"] {
+            config["containers"][0]["runtime"] = json!(runtime);
+            let error =
+                read_containers(config.as_object().unwrap(), &classes, &classes).unwrap_err();
+            assert!(format!("{error:#}").contains("FUSE requires runtime"));
+        }
+        config["containers"][0]["fuse"] = json!(false);
+        assert!(read_containers(config.as_object().unwrap(), &classes, &classes).is_ok());
+    }
+
+    #[test]
+    fn fuse_is_an_explicit_boolean_permission_per_class() {
+        let classes = vec!["Mounted".to_string(), "Default".to_string()];
+        let mut config = json!({"containers": [
+            {"class_name": "Mounted", "image": "./Dockerfile", "fuse": true},
+            {"class_name": "Default", "image": "./Dockerfile"}
+        ]});
+        let declarations =
+            read_containers(config.as_object().unwrap(), &classes, &classes).unwrap();
+        assert!(declarations[0].fuse);
+        assert!(!declarations[1].fuse);
+        config["containers"][0]["fuse"] = json!(false);
+        assert!(!read_containers(config.as_object().unwrap(), &classes, &classes).unwrap()[0].fuse);
+        for invalid in [json!("true"), json!(1), Value::Null, json!({})] {
+            config["containers"][0]["fuse"] = invalid;
+            let error =
+                read_containers(config.as_object().unwrap(), &classes, &classes).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("containers[0].fuse` must be a boolean"));
+        }
+    }
 }

@@ -1,0 +1,17 @@
+{
+  "name": "container-fuse-test",
+  "main": "worker.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "containers": [
+    { "class_name": "Mounted", "image": "./Dockerfile", "instance_type": "basic", "runtime": "runsc", "fuse": true },
+    { "class_name": "Restricted", "image": "./Dockerfile", "instance_type": "basic", "runtime": "runsc" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOUNTED", "class_name": "Mounted" },
+      { "name": "RESTRICTED", "class_name": "Restricted" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mounted", "Restricted"] }]
+}
