@@ -32,6 +32,9 @@ pub struct Manifest {
     /// needs no migration of an already-armed alarm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crons: Vec<String>,
+    /// Inbound TCP listeners routed to this deployment when it is primary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub socket_workers: Vec<SocketWorkerConfig>,
     /// Push consumers attached to this Worker deployment. Producer bindings
     /// remain in `raw_metadata.bindings`, because they become values in `env`;
     /// consumers drive the broker and have no environment binding.
@@ -66,6 +69,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
     FEATURE_CONTAINERS_V1,
     FEATURE_CRON_V1,
+    FEATURE_SOCKET_WORKERS_V1,
     FEATURE_D1_V1,
     FEATURE_KV_V1,
     FEATURE_QUEUES_V1,
@@ -75,6 +79,46 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
 ];
+
+/// Inbound TCP handlers and deployment-owned listening ports.
+pub const FEATURE_SOCKET_WORKERS_V1: &str = "socket-workers-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SocketWorkerConfig {
+    pub port: u16,
+}
+
+pub fn validate_socket_workers(listeners: &[SocketWorkerConfig]) -> anyhow::Result<()> {
+    let mut ports = std::collections::BTreeSet::new();
+    for listener in listeners {
+        anyhow::ensure!(listener.port != 0, "socket_workers port must be nonzero");
+        anyhow::ensure!(
+            ports.insert(listener.port),
+            "duplicate socket_workers port {}",
+            listener.port
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_socket_worker_manifest(manifest: &Manifest) -> anyhow::Result<()> {
+    validate_socket_workers(&manifest.socket_workers)?;
+    if !manifest.socket_workers.is_empty() {
+        anyhow::ensure!(
+            manifest.main_module.is_some(),
+            "socket_workers requires a main module"
+        );
+        anyhow::ensure!(
+            manifest
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_SOCKET_WORKERS_V1),
+            "Socket Worker deployment does not require {FEATURE_SOCKET_WORKERS_V1}"
+        );
+    }
+    Ok(())
+}
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
 /// A deployment with `containers`. Required because a build without the

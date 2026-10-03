@@ -231,6 +231,7 @@ pub fn check_supported_events(object: &Map<String, Value>) -> anyhow::Result<()>
             "Queue consumers",
         ),
         (non_empty(object.get("containers")), "Containers"),
+        (non_empty(object.get("socket_workers")), "Socket Workers"),
     ] {
         if present {
             bail!("celld does not run {what} in Python Workers yet; a Python Worker handles `fetch` only");

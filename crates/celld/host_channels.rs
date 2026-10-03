@@ -99,6 +99,43 @@ pub struct SvcCallReq {
 pub(crate) static SVC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcCallReq>> =
     OnceLock::new();
 
+/// A socket binding selects an application endpoint, never an Internet host.
+pub enum SocketTarget {
+    Service {
+        script: String,
+        entrypoint: Option<crate::WorkerFetchEntrypoint>,
+    },
+    Cell {
+        scope: String,
+        name: Option<String>,
+        order: Option<crate::js::CallOrder>,
+        parent: Option<crate::telemetry::TraceContext>,
+    },
+}
+
+/// The receiving side of a bounded socket pair. The destination acknowledges
+/// admission through `opened` and owns the stream until its handler finishes.
+pub struct SocketCallReq {
+    pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub generation: crate::generation::GenerationId,
+    pub target: SocketTarget,
+    pub address: String,
+    pub stream: crate::js::TcpConnection,
+    pub opened: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+static SOCKET_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SocketCallReq>> =
+    OnceLock::new();
+
+pub fn set_socket_call_tx(tx: tokio::sync::mpsc::UnboundedSender<SocketCallReq>) {
+    let _ = SOCKET_CALL_TX.set(tx);
+}
+
+pub(crate) fn socket_call_tx() -> Option<&'static tokio::sync::mpsc::UnboundedSender<SocketCallReq>>
+{
+    SOCKET_CALL_TX.get()
+}
+
 /// A Worker assets-binding call. The script name selects the immutable asset
 /// index loaded for that Worker; unlike ingress this never falls back into the
 /// Worker and therefore cannot recurse.

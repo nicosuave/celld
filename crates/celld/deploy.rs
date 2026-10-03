@@ -50,6 +50,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "assets",
     "services",
     "triggers",
+    "socket_workers",
     "vars",
     "d1_databases",
     "kv_namespaces",
@@ -295,6 +296,7 @@ struct Project {
     do_classes: Vec<String>,
     sqlite_classes: Vec<String>,
     crons: Vec<String>,
+    socket_workers: Vec<crate::protocol::SocketWorkerConfig>,
     has_workflows: bool,
     has_kv: bool,
     queue_consumers: Vec<QueueConsumerConfig>,
@@ -680,6 +682,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .collect(),
         assets: asset_reference,
         crons: project.crons.clone(),
+        socket_workers: project.socket_workers.clone(),
         containers: container_specs.clone(),
         fence_image: fence_image.clone(),
         queue_consumers: project.queue_consumers,
@@ -688,6 +691,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         // partially deserializing the manifest and failing at worker load.
         required_features: {
             let mut features = Vec::new();
+            if !project.socket_workers.is_empty() {
+                features.push(crate::protocol::FEATURE_SOCKET_WORKERS_V1.to_string());
+            }
             if built_assets.is_some() {
                 features.push(FEATURE_ASSETS_V1.to_string());
             }
@@ -1376,6 +1382,16 @@ fn read_project(
     if let Some(class) = sqlite_classes.iter().find(|class| is_reserved_class(class)) {
         bail!("`{class}` is a runtime class; remove it from `migrations`");
     }
+    let socket_workers: Vec<crate::protocol::SocketWorkerConfig> = object
+        .get("socket_workers")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .context("config `socket_workers` must be an array of objects containing only `port`")?
+        .unwrap_or_default();
+    crate::protocol::validate_socket_workers(&socket_workers)?;
+    if !socket_workers.is_empty() && main.is_none() {
+        bail!("config sets `socket_workers` without `main`; a socket listener needs a `connect` handler");
+    }
     let crons = read_crons(object)?;
     if !crons.is_empty() && main.is_none() {
         bail!("config sets `triggers.crons` without `main`; a cron trigger needs a `scheduled` handler to call");
@@ -1942,6 +1958,10 @@ fn read_project(
         metadata.insert("compatibility_flags".into(), flags.clone());
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
+    if !socket_workers.is_empty() {
+        // Listener changes must produce a new deployment version.
+        metadata.insert("socket_workers".into(), json!(socket_workers));
+    }
     if !queue_consumers.is_empty() {
         // Include consumer policy in deployment identity. The typed manifest
         // field below is the runtime contract; this copy keeps a settings-only
@@ -1966,6 +1986,7 @@ fn read_project(
         do_classes,
         sqlite_classes,
         crons,
+        socket_workers,
         has_workflows: !workflows.is_empty(),
         has_kv: !kv_namespaces.is_empty(),
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
@@ -3001,4 +3022,101 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod socket_workers_tests {
+    use super::*;
+
+    fn build_config(listeners: Value) -> anyhow::Result<Built> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("index.js"), "export default {};")?;
+        let config = directory.path().join("wrangler.jsonc");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "name": "socket-test",
+                "main": "index.js",
+                "no_bundle": true,
+                "socket_workers": listeners,
+            }))?,
+        )?;
+        let options = options_from_arguments([config.to_string_lossy().into_owned()])?
+            .expect("config argument creates options");
+        build(&options)
+    }
+
+    #[test]
+    fn socket_workers_persist_and_change_deployment_identity() {
+        let first = build_config(json!([{ "port": 5432 }])).unwrap();
+        let second = build_config(json!([{ "port": 5433 }])).unwrap();
+        assert_ne!(first.version, second.version);
+        assert_eq!(first.manifest.socket_workers[0].port, 5432);
+        assert!(first
+            .manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_SOCKET_WORKERS_V1));
+        let manifest: Manifest =
+            serde_json::from_slice(&serde_json::to_vec(&first.manifest).unwrap()).unwrap();
+        crate::protocol::validate_socket_worker_manifest(&manifest).unwrap();
+        let mut missing_feature = manifest;
+        missing_feature.required_features.clear();
+        assert!(crate::protocol::validate_socket_worker_manifest(&missing_feature).is_err());
+    }
+
+    #[test]
+    fn socket_workers_reject_invalid_listener_configuration() {
+        for listeners in [
+            json!([{ "port": 0 }]),
+            json!([{ "port": 65536 }]),
+            json!([{ "port": -1 }]),
+            json!([{ "port": "5432" }]),
+            json!([{ "port": 5432 }, { "port": 5432 }]),
+            json!([{ "port": 5432, "protocol": "udp" }]),
+            json!([{ "port": 5432, "binding": "CONTAINER" }]),
+            json!([{}]),
+            json!({ "port": 5432 }),
+            Value::Null,
+        ] {
+            assert!(
+                build_config(listeners.clone()).is_err(),
+                "accepted {listeners}"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_workers_require_a_worker_module() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("public")).unwrap();
+        let config = directory.path().join("wrangler.jsonc");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "name": "socket-assets",
+                "assets": { "directory": "public" },
+                "socket_workers": [{ "port": 5432 }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = read_project(&config, directory.path(), &BTreeMap::new())
+            .err()
+            .expect("asset-only socket worker rejected");
+        assert!(error.to_string().contains("without `main`"));
+    }
+
+    #[test]
+    fn socket_workers_empty_configuration_remains_compatible() {
+        let built = build_config(json!([])).unwrap();
+        assert!(built.manifest.socket_workers.is_empty());
+        assert!(!built
+            .manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_SOCKET_WORKERS_V1));
+        let encoded = serde_json::to_value(built.manifest).unwrap();
+        assert!(encoded.get("socket_workers").is_none());
+    }
 }

@@ -516,6 +516,11 @@ pub enum WorkerRpcOperation {
 }
 
 pub enum WorkerJob {
+    Connect {
+        entrypoint: Option<WorkerFetchEntrypoint>,
+        connection: js::RuntimeConnect,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
     Fetch {
         queued_at: std::time::Instant,
         /// An entrypoint dispatcher target, or the direct default export when

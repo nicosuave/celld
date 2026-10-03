@@ -744,6 +744,18 @@ pub struct RuntimeFetch {
     pub parent: Option<crate::telemetry::TraceContext>,
 }
 
+/// A bidirectional connection transferred into one Worker or cell event.
+pub struct RuntimeConnect {
+    pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub stream: crate::js::TcpConnection,
+    pub address: String,
+    pub request_id: Option<RequestId>,
+    pub order: Option<crate::js::CallOrder>,
+    pub parent: Option<crate::telemetry::TraceContext>,
+    /// Acknowledged only after the destination's connect handler is found.
+    pub opened: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
 /// What a Durable Object RPC method returned, plus the position its writes
 /// reached, so the caller can hold the reply behind durability.
 pub struct RpcOutcome {

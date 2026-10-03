@@ -180,6 +180,9 @@ impl StatelessWorkerJob {
             crate::WorkerJob::Fetch { request_id, .. } => {
                 request_id.map(RequestCancellationLifetime::from_request_id)
             }
+            crate::WorkerJob::Connect { connection, .. } => connection
+                .request_id
+                .map(RequestCancellationLifetime::from_request_id),
             crate::WorkerJob::Rpc { .. } | crate::WorkerJob::Queue { .. } => None,
         };
         let cancellation = RequestCancellationGuard::new(lifetime);
@@ -469,6 +472,7 @@ pub struct StatelessRuntime {
 #[derive(Clone, Copy)]
 #[doc(hidden)]
 pub enum StatelessVerb {
+    Connect,
     Fetch,
     Rpc,
     Queue,
@@ -477,6 +481,7 @@ pub enum StatelessVerb {
 impl StatelessVerb {
     fn task_died(self, error: tokio::task::JoinError) -> anyhow::Error {
         match self {
+            Self::Connect => anyhow!("stateless connect task died: {error}"),
             Self::Fetch => anyhow!("stateless request task died: {error}"),
             Self::Rpc => anyhow!("stateless RPC task died: {error}"),
             Self::Queue => anyhow!("stateless queue task died: {error}"),
@@ -485,6 +490,7 @@ impl StatelessVerb {
 
     fn dropped_result(self) -> anyhow::Error {
         match self {
+            Self::Connect => anyhow!("stateless Worker dropped connect result"),
             Self::Fetch => anyhow!("stateless Worker dropped response"),
             Self::Rpc => anyhow!("stateless Worker dropped RPC result"),
             Self::Queue => anyhow!("stateless Worker dropped queue result"),
@@ -661,6 +667,32 @@ async fn receive_cell_fetch_reply(
         _ => receive.await,
     };
     received.context("cell isolate dropped response")?
+}
+
+/// The outer socket route may disappear while the driver owns pending reads.
+/// Publishing through the driver's lifetime closes those ops without leaving
+/// cancellation tombstones after a completed event.
+struct ConnectionCaller(Arc<RequestCancellationLifetime>);
+impl Drop for ConnectionCaller {
+    fn drop(&mut self) {
+        self.0.publish_abort();
+    }
+}
+
+async fn wait_for_connection(
+    response: impl std::future::Future<Output = anyhow::Result<()>>,
+    cancellation: Arc<RequestCancellationLifetime>,
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> anyhow::Result<()> {
+    let _caller = ConnectionCaller(cancellation);
+    match cancel {
+        Some(mut cancel) => crate::asyncrt::select_biased! {
+            "completed socket handlers win a tie with disconnect";
+            result = response => result,
+            _ = &mut cancel => Err(anyhow!("socket caller disconnected")),
+        },
+        None => response.await,
+    }
 }
 
 async fn receive_service_fetch_response(
@@ -884,6 +916,26 @@ impl RuntimeManager {
                 }
             }
         });
+    }
+
+    pub async fn connect_worker(&self, connection: js::RuntimeConnect) -> anyhow::Result<()> {
+        let generation = self.generation();
+        generation.stateless.connect(None, connection).await
+    }
+
+    pub async fn connect_service(
+        &self,
+        generation: GenerationId,
+        script: &str,
+        entrypoint: Option<crate::WorkerFetchEntrypoint>,
+        connection: js::RuntimeConnect,
+    ) -> anyhow::Result<()> {
+        let generation = self.generation_by_id(generation);
+        generation
+            .service(script)
+            .ok_or_else(|| anyhow!("no service Worker for script {script}"))?
+            .connect(entrypoint, connection)
+            .await
     }
 
     pub async fn fetch_worker(
@@ -1517,6 +1569,73 @@ impl RuntimeManager {
                 stop_facet,
             )
             .await
+    }
+
+    pub async fn connect_cell(
+        &self,
+        cell: String,
+        name: Option<String>,
+        mut connection: js::RuntimeConnect,
+    ) -> anyhow::Result<()> {
+        let admitted = self
+            .admit_cell_request(&cell)?
+            .ok_or_else(|| anyhow!("cell request limit reached"))?;
+        let request_id = connection.request_id.unwrap_or_else(js::next_do_request_id);
+        connection.request_id = Some(request_id);
+        let cancel = connection.cancel.take();
+        let parent = connection.parent;
+        let cancellation = {
+            let mut requests = self
+                .remote_requests
+                .lock()
+                .expect("request registry poisoned");
+            requests.prune();
+            if matches!(
+                requests.states.remove(&request_id),
+                Some(RemoteRequestState::PendingAbort(_))
+            ) {
+                requests.completed(request_id);
+                return Err(anyhow!("the client disconnected before dispatch"));
+            }
+            requests.active(request_id)
+        };
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::Connect {
+            scope: cell,
+            name,
+            connection,
+            reply,
+        };
+        let alarm_reporter = self.alarm_reporter.clone();
+        let drive_cancellation = cancellation.clone();
+        let requests = self.remote_requests.clone();
+        let driving = tokio::spawn(async move {
+            let _permit = admitted.permit;
+            drive_cell_with_request_cancellation(
+                admitted.affiliation,
+                job,
+                Some(alarm_reporter),
+                parent,
+                Some(drive_cancellation),
+            )
+            .await;
+            requests
+                .lock()
+                .expect("request registry poisoned")
+                .completed(request_id);
+        });
+        wait_for_connection(
+            async move {
+                let result = receive
+                    .await
+                    .context("cell isolate dropped connect result")?;
+                driving.await.context("cell socket driver died")?;
+                result
+            },
+            cancellation,
+            cancel,
+        )
+        .await
     }
 
     pub async fn fetch_cell(
@@ -2458,6 +2577,12 @@ impl StatelessTiming {
         remote_parent: Option<crate::telemetry::ParentContext>,
     ) -> Self {
         let (queued_at, request_id, span_name, span_kind) = match job {
+            crate::WorkerJob::Connect { connection, .. } => (
+                Instant::now(),
+                connection.request_id,
+                "celld.connect",
+                crate::telemetry::KIND_SERVER,
+            ),
             crate::WorkerJob::Fetch {
                 queued_at,
                 request_id,
@@ -2681,7 +2806,15 @@ impl StatelessRuntime {
             Some((self.node.clone(), self.region.clone())),
         ));
         match receive.await {
-            Ok(result) => result,
+            Ok(result) => {
+                // A socket remains the caller's active connection through
+                // waitUntil work; returning at handler settlement would let
+                // the route retire while its stream pump is still running.
+                if matches!(verb, StatelessVerb::Connect) {
+                    driving.await.map_err(|error| verb.task_died(error))?;
+                }
+                result
+            }
             // The driver dropped the reply without sending. Joining it here —
             // and only here — turns a bare "channel closed" into the panic
             // that actually caused it, at no cost on the path that works.
@@ -2729,6 +2862,32 @@ impl StatelessRuntime {
                 .dispatch_stateless(StatelessVerb::Fetch, shedding, make_job)
                 .await
         }
+    }
+
+    async fn connect(
+        &self,
+        entrypoint: Option<crate::WorkerFetchEntrypoint>,
+        mut connection: js::RuntimeConnect,
+    ) -> anyhow::Result<()> {
+        let cancellation = RequestCancellationLifetime::from_request_id(
+            connection.request_id.unwrap_or_else(js::next_request_id),
+        );
+        connection.request_id = Some(cancellation.request_id());
+        let cancel = connection.cancel.take();
+        let guard = RequestCancellationGuard::shared(cancellation.clone());
+        let dispatch = self.dispatch_stateless(
+            StatelessVerb::Connect,
+            crate::ownership_store::node_is_shedding(),
+            move |reply| StatelessWorkerJob {
+                job: crate::WorkerJob::Connect {
+                    entrypoint,
+                    connection,
+                    reply,
+                },
+                cancellation: guard,
+            },
+        );
+        wait_for_connection(dispatch, cancellation, cancel).await
     }
 
     /// An entrypoint RPC, on the isolate pool like fetch.
@@ -3189,6 +3348,7 @@ async fn drive_cell_inner(
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_seed = recording.map(|_| {
         let name = match &job {
+            CellJob::Connect { .. } => "celld.cell_connect",
             CellJob::Fetch { .. } => "celld.cell_fetch",
             CellJob::Alarm { .. } => "celld.alarm",
             CellJob::Rpc { .. } => "celld.rpc",
@@ -3439,5 +3599,236 @@ fn install_container_specs(generation: &Generation) {
     }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(crate::container::prewarm());
+    }
+}
+
+#[cfg(all(test, not(celld_internal_tests)))]
+mod connect_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn worker(source: &str) -> StatelessRuntime {
+        // asyncrt owns one process-wide host domain, so its runtime must
+        // outlive every individual Tokio test runtime.
+        static HOST: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        HOST.get_or_init(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            crate::asyncrt::set_host_handle(runtime.handle().clone());
+            runtime
+        });
+        init_v8();
+        let config = js::WorkerConfig::new(js::WorkerConfigOptions {
+            src: source.into(),
+            script_name: "socket-test".into(),
+            do_classes: vec![],
+            bindings: vec![],
+            r2_bindings: vec![],
+            d1_bindings: vec![],
+            kv_bindings: vec![],
+            queue_bindings: vec![],
+            queue_consumers: vec![],
+            workflow_bindings: vec![],
+            vars: vec![],
+            node: "socket-test".into(),
+            modules: vec![],
+            compat: js::Compat::default(),
+        });
+        StatelessRuntime::start(Arc::new(config), "socket-test".into(), "test".into()).unwrap()
+    }
+
+    fn connection() -> (
+        tokio::io::DuplexStream,
+        js::RuntimeConnect,
+        tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(1024);
+        let (opened, ready) = tokio::sync::oneshot::channel();
+        (
+            client,
+            js::RuntimeConnect {
+                stream: Box::new(server),
+                address: "client:1234".into(),
+                request_id: None,
+                order: None,
+                parent: None,
+                opened,
+                cancel: None,
+            },
+            ready,
+        )
+    }
+
+    #[tokio::test]
+    async fn connect_default_echo_preserves_binary_and_eof() {
+        let runtime = worker("export default { async connect(socket, env, ctx) { if (!ctx.waitUntil) throw Error('missing context'); await socket.readable.pipeTo(socket.writable); } }");
+        let (mut client, connection, ready) = connection();
+        let driving = tokio::spawn(async move { runtime.connect(None, connection).await });
+        ready.await.unwrap().unwrap();
+        let bytes = [0, 255, 128, 1, 13, 10];
+        client.write_all(&bytes).await.unwrap();
+        let mut echoed = [0; 6];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, bytes);
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), driving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_named_entrypoint_gets_its_context() {
+        let runtime = worker("import { WorkerEntrypoint } from 'cloudflare:workers'; export class Echo extends WorkerEntrypoint { async connect(socket) { const writer = socket.writable.getWriter(); await writer.write(new TextEncoder().encode(typeof this.ctx.waitUntil)); await writer.close(); } }");
+        let (mut client, connection, ready) = connection();
+        let driving = tokio::spawn(async move {
+            runtime
+                .connect(
+                    Some(crate::WorkerFetchEntrypoint {
+                        name: "Echo".into(),
+                        props: vec![],
+                    }),
+                    connection,
+                )
+                .await
+        });
+        ready.await.unwrap().unwrap();
+        let mut output = Vec::new();
+        client.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"function");
+        driving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_closed_settles_after_both_stream_halves_finish() {
+        let runtime = worker(
+            r#"export default {
+            async connect(socket) {
+                await socket.readable.pipeTo(socket.writable);
+                await socket.closed;
+            }
+        }"#,
+        );
+        let (mut client, connection, ready) = connection();
+        let driving = tokio::spawn(async move { runtime.connect(None, connection).await });
+        ready.await.unwrap().unwrap();
+        client.write_all(b"last bytes").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut output))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, b"last bytes");
+        tokio::time::timeout(Duration::from_secs(5), driving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_peer_eof_allows_delayed_response() {
+        let runtime = worker(
+            r#"export default {
+            async connect(socket) {
+                const chunks = [];
+                const reader = socket.readable.getReader();
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                }
+                await new Promise(resolve => setTimeout(resolve, 5));
+                const writer = socket.writable.getWriter();
+                for (const chunk of chunks) await writer.write(chunk);
+                await writer.close();
+            }
+        }"#,
+        );
+        let (mut client, connection, ready) = connection();
+        let driving = tokio::spawn(async move { runtime.connect(None, connection).await });
+        ready.await.unwrap().unwrap();
+        let input: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
+        client.write_all(&input).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut output))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, input);
+        driving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_missing_handler_rejects_opened() {
+        let runtime = worker("export default { fetch() { return new Response('http'); } }");
+        let (_client, connection, ready) = connection();
+        let error = runtime.connect(None, connection).await.unwrap_err();
+        assert!(error.to_string().contains("connect"), "{error:#}");
+        assert!(ready.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_only_worker_rejects_http_dispatch() {
+        let runtime = worker("export default { connect(socket) {} }");
+        let error = runtime
+            .fetch(
+                "http://socket-test/".into(),
+                "GET".into(),
+                Vec::new().into(),
+                vec![],
+                None,
+            )
+            .await
+            .err()
+            .expect("connect-only worker must reject HTTP dispatch");
+        assert!(
+            error
+                .to_string()
+                .contains("does not export a fetch() function"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_wait_until_keeps_socket_alive() {
+        let runtime = worker("export default { connect(socket, env, ctx) { ctx.waitUntil(socket.readable.pipeTo(socket.writable)); } }");
+        let (mut client, connection, ready) = connection();
+        let driving = tokio::spawn(async move { runtime.connect(None, connection).await });
+        ready.await.unwrap().unwrap();
+        client.write_all(b"background").await.unwrap();
+        let mut echoed = [0; 10];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"background");
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), driving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_cancellation_closes_a_pending_read() {
+        let runtime = worker("export default { async connect(socket) { await socket.readable.getReader().read(); } }");
+        let (mut client, mut connection, ready) = connection();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        connection.cancel = Some(cancelled);
+        let driving = tokio::spawn(async move { runtime.connect(None, connection).await });
+        ready.await.unwrap().unwrap();
+        cancel.send(()).unwrap();
+        assert!(driving.await.unwrap().is_err());
+        let mut byte = [0];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

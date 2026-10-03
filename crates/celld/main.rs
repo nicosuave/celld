@@ -811,6 +811,7 @@ async fn adopt_deployment(
     region: &str,
     pointer: DeployPointer,
     force: bool,
+    sockets: &socket::Listeners,
 ) -> ReloadOutcome {
     let Some(runtime) = app.runtime.as_ref() else {
         return ReloadOutcome::Failed {
@@ -847,7 +848,12 @@ async fn adopt_deployment(
         Ok(Err(error)) => return failed(format!("{error:#}")),
         Err(error) => return failed(format!("generation build panicked: {error}")),
     };
+    let prepared = match sockets.prepare(&generation).await {
+        Ok(prepared) => prepared,
+        Err(error) => return failed(format!("{error:#}")),
+    };
     let adopted = runtime.adopt(generation);
+    sockets.commit(prepared, app.clone());
     // Tell the core, so resident cells move to the new generation at their
     // safe points. The reserved cells move at once, ahead of the cron arm
     // below, which must reach a cron cell already running the new schedule.
@@ -879,6 +885,7 @@ fn start_pointer_watcher(
     node: String,
     region: String,
     mut requests: celld::generation::ReloadReceiver,
+    sockets: Arc<socket::Listeners>,
 ) {
     tokio::spawn(async move {
         let period = celld::generation::poll_interval();
@@ -912,8 +919,16 @@ fn start_pointer_watcher(
                         failed.clone().expect("matched above")
                     }
                     _ => {
-                        adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
-                            .await
+                        adopt_deployment(
+                            &app,
+                            &bucket,
+                            &node,
+                            &region,
+                            pointer,
+                            request.force,
+                            &sockets,
+                        )
+                        .await
                     }
                 },
             };
@@ -2240,6 +2255,8 @@ pub(crate) async fn dispatch_forwarded_rpc(
 
 #[path = "main/peer_tunnel.rs"]
 mod peer_tunnel;
+#[path = "main/socket.rs"]
+mod socket;
 #[path = "main/websocket.rs"]
 mod websocket;
 use websocket::{handle_websocket, outbound_websocket_task};
@@ -2794,6 +2811,7 @@ async fn handle_internal(
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
+        "/peer/socket" => socket::accept(request, app).await,
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
@@ -3972,6 +3990,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     assets: None,
                     services: Vec::new(),
                     crons,
+                    socket_workers: Vec::new(),
                     containers: Vec::new(),
                     fence_image: None,
                 }),
@@ -4262,6 +4281,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_svc_call_tx(service_call_tx);
     let (service_rpc_tx, mut service_rpc_rx) = mpsc::unbounded_channel();
     celld::js::set_svc_rpc_tx(service_rpc_tx);
+    let (socket_call_tx, mut socket_call_rx) = mpsc::unbounded_channel();
+    celld::host_channels::set_socket_call_tx(socket_call_tx);
     let (queue_dispatch_tx, mut queue_dispatch_rx) = mpsc::unbounded_channel();
     celld::js::set_queue_dispatch_tx(queue_dispatch_tx);
     let (asset_call_tx, mut asset_call_rx) = mpsc::unbounded_channel();
@@ -4591,6 +4612,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Arm the schedule, then watch the pointer. Adoption arms it again, so
     // a cron change travels with the deployment that carries it.
     spawn_cron_arm(app.clone());
+    let sockets = socket::Listeners::new(listener.local_addr()?.ip());
+    if let Some(runtime) = &app.runtime {
+        let prepared = sockets.prepare(&runtime.generation()).await?;
+        sockets.commit(prepared, app.clone());
+    }
     if let Some(bucket) = deploy_bucket {
         start_pointer_watcher(
             app.clone(),
@@ -4598,6 +4624,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             node.clone(),
             settings.region.clone(),
             reload_rx,
+            sockets.clone(),
         );
     }
     if let Some(client) = deploy_agent {
@@ -4706,6 +4733,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     anyhow::bail!("service call channel closed");
                 };
                 service_calls.push(Box::pin(dispatch_service_call(app.clone(), call)));
+            }
+            call = socket_call_rx.recv() => {
+                let Some(call) = call else {
+                    anyhow::bail!("socket binding channel closed");
+                };
+                tokio::spawn(socket::dispatch(app.clone(), call));
             }
             call = service_rpc_rx.recv() => {
                 let Some(call) = call else {
@@ -4820,6 +4853,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
         }
     };
+    sockets.stop();
     // This deadline starts at the stop signal and covers token acquisition,
     // request drain, ownership handoff, transport flush, and local durability
     // shutdown. Progress can extend only the inner stall deadline. The
